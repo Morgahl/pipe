@@ -17,13 +17,12 @@ import (
 	"sync"
 	"time"
 
-	"github.com/curlymon/pipes"
-	"github.com/curlymon/pipes/async"
+	"github.com/Morgahl/pipe"
 )
 
 const (
-	Workers  = 4
-	ChanSize = Workers * Workers
+	COUNT   = 4
+	CH_SIZE = COUNT * COUNT
 )
 
 func init() {
@@ -36,29 +35,31 @@ func main() {
 		log.Fatalln(err)
 	}
 
-	filePipe := pipeline(true, dir)
-	filePipe = async.MapWithErrorSink(Workers, ChanSize, openFile, logError("error opening file"), filePipe)
-	filePipe = async.MapWithErrorSink(Workers, ChanSize, multiHash, logError("error multi hashing file"), filePipe)
-	filePipe = async.MapWithErrorSink(Workers, ChanSize, closeFile, logError("error closing file"), filePipe)
-	// filePipe = pipes.Tap(ChanSize, logFileFound, filePipe)
+	start := time.Now()
+	results := pipeline(CH_SIZE, true, dir).
+		MapErrorSinkAsync(COUNT, openFile, logError("error opening file")).
+		MapErrorSinkAsync(COUNT, multiHash, logError("error multi hashing file")).
+		MapErrorSinkAsync(COUNT, closeFile, logError("error closing file")).
+		// Tap(logFileFound).
+		Window(time.Second, newResults, compileResult).
+		Tap(logAny[*Results]).
+		Reduce(&Results{}, compileResults)
 
-	resultPipe := pipes.Window(ChanSize, time.Second, compileResult, newResults, filePipe)
-	resultPipe = pipes.Tap(ChanSize, logAny[*Results], resultPipe)
-
-	log.Println(pipes.Reduce(compileResults, &Results{}, resultPipe))
+	log.Println(results)
+	log.Printf("took=%s", time.Since(start))
 }
 
-func pipeline(recurse bool, dir string) pipes.ChanPull[*FileInfo] {
-	out := pipes.New[*FileInfo](10)
+func pipeline(size int, recurse bool, dir string) pipe.Tail[*FileInfo] {
+	head, tail := pipe.New[*FileInfo](size)
 
 	go func() {
-		defer out.Close()
-		if err := filepath.WalkDir(dir, walkFunc(dir, recurse, out)); err != nil {
+		defer head.Close()
+		if err := filepath.WalkDir(dir, walkFunc(dir, recurse, head)); err != nil {
 			log.Printf("error walking directory: dir=%s, err=%s", dir, err)
 		}
 	}()
 
-	return out.ChanPull()
+	return tail
 }
 
 func walkFunc(dir string, recurse bool, out chan<- *FileInfo) func(string, fs.DirEntry, error) error {
@@ -89,7 +90,6 @@ func walkFunc(dir string, recurse bool, out chan<- *FileInfo) func(string, fs.Di
 		out <- &FileInfo{
 			Path:  path,
 			Entry: d,
-			Start: time.Now(),
 		}
 
 		return nil
@@ -118,7 +118,7 @@ func getDir(args []string) (string, error) {
 
 func compileResult(fi *FileInfo, results *Results) *Results {
 	results.Found++
-	results.TotalDuration += time.Since(fi.Start)
+	results.TotalDuration += fi.Duration
 	return results
 }
 
@@ -137,7 +137,9 @@ type FileInfo struct {
 	SHA1   []byte
 	SHA256 []byte
 	SHA512 []byte
-	Start  time.Time
+	Start    time.Time
+	End      time.Time
+	Duration time.Duration
 }
 
 type Results struct {
@@ -149,15 +151,16 @@ func newResults() *Results {
 	return new(Results)
 }
 
-func (r Results) String() string {
-	count := r.Found
+func (r Results) Average() time.Duration {
 	if r.Found == 0 {
-		count++
+		return 0
 	}
 
-	avg := time.Duration(float64(r.TotalDuration) / float64(count))
+	return r.TotalDuration / time.Duration(r.Found)
+}
 
-	return fmt.Sprintf("Processed: %d, Avg: %s, Tot: %s", r.Found, avg, r.TotalDuration)
+func (r Results) String() string {
+	return fmt.Sprintf("Processed: %d, Avg: %s, Tot: %s", r.Found, r.Average(), r.TotalDuration)
 }
 
 var fileBuffers = sync.Pool{
@@ -167,6 +170,8 @@ var fileBuffers = sync.Pool{
 }
 
 func openFile(fi *FileInfo) (*FileInfo, error) {
+	fi.Start = time.Now()
+
 	f, err := os.Open(fi.Path)
 	if err != nil {
 		return &FileInfo{}, err
@@ -187,6 +192,8 @@ func closeFile(fi *FileInfo) (*FileInfo, error) {
 
 	err := fi.File.Close()
 	fi.File = nil
+	fi.End = time.Now()
+	fi.Duration = fi.End.Sub(fi.Start)
 
 	return fi, err
 }
@@ -222,8 +229,8 @@ func multiHash(fi *FileInfo) (*FileInfo, error) {
 func logFileFound(fi *FileInfo) {
 	info, _ := fi.Entry.Info()
 	log.Printf(
-		"Found file: name=%s, md5=%.8X, sha1=%.8X, sha256=%.8X, sha512=%.8X, size=%d, took=%s",
-		fi.Entry.Name(), fi.MD5, fi.SHA1, fi.SHA256, fi.SHA512, info.Size(), time.Since(fi.Start),
+		"Found file: name=%s, md5=%.8X, sha1=%.8X, sha256=%.8X, sha512=%.8X, size=%d, start=%s, end=%s, took=%s",
+		fi.Entry.Name(), fi.MD5, fi.SHA1, fi.SHA256, fi.SHA512, info.Size(), fi.Start.Format(time.StampMicro), fi.End.Format(time.StampMicro), fi.Duration,
 	)
 }
 

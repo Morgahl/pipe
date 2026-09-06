@@ -1,3 +1,3 @@
-module github.com/curlymon/pipes
+module github.com/Morgahl/pipe
 
-go 1.18
+go 1.27
