@@ -42,8 +42,12 @@ func FanIn[T any](size int, tails ...Tail[T]) Tail[T] {
 // pushing each T onto the returned tail only channel of specified size. Once repeat is exhausted the
 // goroutine calls closer, closes the returned tail only channel and exits. Passing 0 or any other
 // negative value calls source zero times, calls closer and closes the channel immeadiately. Passing
-// [RepeatForever] will call source until the program exits. Passing a nil source panics. A nil closer
-// is treated as a no-op.
+// [RepeatForever] will call source until the program exits. A nil closer is treated as a no-op.
+//
+// Panics:
+//   - passing a nil source panics
+//   - a panic in source is not recovered
+//   - a panic in closer is not recovered
 func Source[T any, S func() T, C func()](repeat, size int, source S, closer C) Tail[T] {
 	assert(source != nil, "pipe: Source: nil source")
 	if closer == nil {
@@ -58,7 +62,12 @@ func Source[T any, S func() T, C func()](repeat, size int, source S, closer C) T
 // Each error is pushed onto the returned error tail only channel and no T is pushed for that call.
 // Returning [Done] from source ends the goroutine as if repeat were exhausted and [Done] is not
 // pushed. closer is called and both returned channels are closed once repeat is exhausted or [Done]
-// is returned. Passing a nil source panics. A nil closer is treated as a no-op.
+// is returned. A nil closer is treated as a no-op.
+//
+// Panics:
+//   - passing a nil source panics
+//   - a panic in source is recovered and pushed onto the error channel as a [*PanicError]
+//   - a panic in closer is recovered and pushed onto the error channel as a [*PanicError]
 func SourceError[T any, S func() (T, error), C func()](repeat, size int, source S, closer C) (Tail[T], Tail[error]) {
 	assert(source != nil, "pipe: SourceError: nil source")
 	if closer == nil {
@@ -71,8 +80,15 @@ func SourceError[T any, S func() (T, error), C func()](repeat, size int, source 
 }
 
 // SourceErrorSink is a non-blocking operation that behaves as [SourceError] but each error is
-// passed to sink instead of being pushed onto a channel. [Done] is not passed to sink. Passing a nil
-// source or sink panics. A nil closer is treated as a no-op.
+// passed to sink instead of being pushed onto a channel. [Done] is not passed to sink. A nil closer
+// is treated as a no-op.
+//
+// Panics:
+//   - passing a nil source or sink panics
+//   - a panic in source is recovered and passed to sink as a [*PanicError]
+//   - a panic in closer is recovered and passed to sink as a [*PanicError]
+//   - a panic in sink is recovered and sink is called again with the [*PanicError]
+//   - a panic in that second call is not recovered
 func SourceErrorSink[T any, S func() (T, error), C func(), E func(error)](repeat, size int, source S, closer C, sink E) Tail[T] {
 	assert(source != nil, "pipe: SourceErrorSink: nil source")
 	assert(sink != nil, "pipe: SourceErrorSink: nil sink")
@@ -129,7 +145,11 @@ func (tl Tail[T]) Wait() {
 
 // FanOut is a non-blocking operation that creates count tail only channels of the same size as this
 // channel and forwards every T pulled onto each of them. All returned channels are closed after this
-// channel is closed and emptied. A nil Tail panics. A negative count panics.
+// channel is closed and emptied.
+//
+// Panics:
+//   - a nil Tail panics
+//   - a negative count panics
 func (tl Tail[T]) FanOut(count int) []Tail[T] {
 	assert(tl != nil, "pipe: Tail.FanOut: nil %T", tl)
 	tails := make([]Tail[T], count)
@@ -143,7 +163,11 @@ func (tl Tail[T]) FanOut(count int) []Tail[T] {
 
 // Filter is a non-blocking operation that forwards each T for which filter returns true onto the
 // returned tail only channel of the same size as this channel. The returned channel is closed after
-// this channel is closed and emptied. A nil Tail or a nil filter panics.
+// this channel is closed and emptied.
+//
+// Panics:
+//   - a nil Tail or a nil filter panics
+//   - a panic in filter is not recovered
 func (tl Tail[T]) Filter[F func(T) bool](filter F) Tail[T] {
 	assert(tl != nil, "pipe: Tail.Filter: nil %T", tl)
 	assert(filter != nil, "pipe: Tail.Filter: nil filter")
@@ -160,7 +184,9 @@ func (tl Tail[T]) Filter[F func(T) bool](filter F) Tail[T] {
 // returned channel independently, so values are emitted in the order filter finishes, not the order
 // they were pulled.
 //
-// A nil Tail or a nil filter panics.
+// Panics:
+//   - a nil Tail or a nil filter panics
+//   - a panic in filter is not recovered
 func (tl Tail[T]) FilterAsync[F func(T) bool](workers int, filter F) Tail[T] {
 	assert(tl != nil, "pipe: Tail.FilterAsync: nil %T", tl)
 	assert(filter != nil, "pipe: Tail.FilterAsync: nil filter")
@@ -171,8 +197,11 @@ func (tl Tail[T]) FilterAsync[F func(T) bool](workers int, filter F) Tail[T] {
 
 // FilterError is a non-blocking operation that behaves as [Tail.Filter] but filter may return an
 // error. Each error is pushed onto the returned error tail only channel and the T is discarded.
-// Both returned channels are closed after this channel is closed and emptied. A nil Tail or a nil
-// filter panics.
+// Both returned channels are closed after this channel is closed and emptied.
+//
+// Panics:
+//   - a nil Tail or a nil filter panics
+//   - a panic in filter is recovered and pushed onto the error channel as a [*PanicError]
 func (tl Tail[T]) FilterError[F func(T) (bool, error)](filter F) (Tail[T], Tail[error]) {
 	assert(tl != nil, "pipe: Tail.FilterError: nil %T", tl)
 	assert(filter != nil, "pipe: Tail.FilterError: nil filter")
@@ -190,7 +219,9 @@ func (tl Tail[T]) FilterError[F func(T) (bool, error)](filter F) (Tail[T], Tail[
 // the returned channels independently, so values and errors are emitted in the order filter
 // finishes, not the order they were pulled.
 //
-// A nil Tail or a nil filter panics.
+// Panics:
+//   - a nil Tail or a nil filter panics
+//   - a panic in filter is recovered and pushed onto the error channel as a [*PanicError]
 func (tl Tail[T]) FilterErrorAsync[F func(T) (bool, error)](workers int, filter F) (Tail[T], Tail[error]) {
 	assert(tl != nil, "pipe: Tail.FilterErrorAsync: nil %T", tl)
 	assert(filter != nil, "pipe: Tail.FilterErrorAsync: nil filter")
@@ -201,7 +232,13 @@ func (tl Tail[T]) FilterErrorAsync[F func(T) (bool, error)](workers int, filter 
 }
 
 // FilterErrorSink is a non-blocking operation that behaves as [Tail.FilterError] but each error is
-// passed to sink instead of being pushed onto a channel. A nil Tail, filter or sink panics.
+// passed to sink instead of being pushed onto a channel.
+//
+// Panics:
+//   - a nil Tail, filter or sink panics
+//   - a panic in filter is recovered and passed to sink as a [*PanicError]
+//   - a panic in sink is recovered and sink is called again with the [*PanicError]
+//   - a panic in that second call is not recovered
 func (tl Tail[T]) FilterErrorSink[F func(T) (bool, error), S func(error)](filter F, sink S) Tail[T] {
 	assert(tl != nil, "pipe: Tail.FilterErrorSink: nil %T", tl)
 	assert(filter != nil, "pipe: Tail.FilterErrorSink: nil filter")
@@ -219,7 +256,11 @@ func (tl Tail[T]) FilterErrorSink[F func(T) (bool, error), S func(error)](filter
 // the returned channel and calls sink independently, so values are emitted and errors sunk in the
 // order filter finishes, not the order they were pulled.
 //
-// A nil Tail, filter or sink panics.
+// Panics:
+//   - a nil Tail, filter or sink panics
+//   - a panic in filter is recovered and passed to sink as a [*PanicError]
+//   - a panic in sink is recovered and sink is called again with the [*PanicError]
+//   - a panic in that second call is not recovered
 func (tl Tail[T]) FilterErrorSinkAsync[F func(T) (bool, error), S func(error)](workers int, filter F, sink S) Tail[T] {
 	assert(tl != nil, "pipe: Tail.FilterErrorSinkAsync: nil %T", tl)
 	assert(filter != nil, "pipe: Tail.FilterErrorSinkAsync: nil filter")
@@ -231,7 +272,11 @@ func (tl Tail[T]) FilterErrorSinkAsync[F func(T) (bool, error), S func(error)](w
 
 // Map is a non-blocking operation that pushes the result of mp for each T onto the returned tail
 // only channel of the same size as this channel. The returned channel is closed after this channel
-// is closed and emptied. A nil Tail or a nil mp panics.
+// is closed and emptied.
+//
+// Panics:
+//   - a nil Tail or a nil mp panics
+//   - a panic in mp is not recovered
 func (tl Tail[T]) Map[U any, M func(T) U](mp M) Tail[U] {
 	assert(tl != nil, "pipe: Tail.Map: nil %T", tl)
 	assert(mp != nil, "pipe: Tail.Map: nil mp")
@@ -248,7 +293,9 @@ func (tl Tail[T]) Map[U any, M func(T) U](mp M) Tail[U] {
 // returned channel independently, so values are emitted in the order mp finishes, not the order
 // they were pulled.
 //
-// A nil Tail or a nil mp panics.
+// Panics:
+//   - a nil Tail or a nil mp panics
+//   - a panic in mp is not recovered
 func (tl Tail[T]) MapAsync[U any, M func(T) U](workers int, mp M) Tail[U] {
 	assert(tl != nil, "pipe: Tail.MapAsync: nil %T", tl)
 	assert(mp != nil, "pipe: Tail.MapAsync: nil mp")
@@ -259,8 +306,11 @@ func (tl Tail[T]) MapAsync[U any, M func(T) U](workers int, mp M) Tail[U] {
 
 // MapError is a non-blocking operation that behaves as [Tail.Map] but mp may return an error. Each
 // error is pushed onto the returned error tail only channel and no U is pushed for that T. Both
-// returned channels are closed after this channel is closed and emptied. A nil Tail or a nil mp
-// panics.
+// returned channels are closed after this channel is closed and emptied.
+//
+// Panics:
+//   - a nil Tail or a nil mp panics
+//   - a panic in mp is recovered and pushed onto the error channel as a [*PanicError]
 func (tl Tail[T]) MapError[U any, M func(T) (U, error)](mp M) (Tail[U], Tail[error]) {
 	assert(tl != nil, "pipe: Tail.MapError: nil %T", tl)
 	assert(mp != nil, "pipe: Tail.MapError: nil mp")
@@ -278,7 +328,9 @@ func (tl Tail[T]) MapError[U any, M func(T) (U, error)](mp M) (Tail[U], Tail[err
 // returned channels independently, so values and errors are emitted in the order mp finishes, not
 // the order they were pulled.
 //
-// A nil Tail or a nil mp panics.
+// Panics:
+//   - a nil Tail or a nil mp panics
+//   - a panic in mp is recovered and pushed onto the error channel as a [*PanicError]
 func (tl Tail[T]) MapErrorAsync[U any, M func(T) (U, error)](workers int, mp M) (Tail[U], Tail[error]) {
 	assert(tl != nil, "pipe: Tail.MapErrorAsync: nil %T", tl)
 	assert(mp != nil, "pipe: Tail.MapErrorAsync: nil mp")
@@ -289,7 +341,13 @@ func (tl Tail[T]) MapErrorAsync[U any, M func(T) (U, error)](workers int, mp M) 
 }
 
 // MapErrorSink is a non-blocking operation that behaves as [Tail.MapError] but each error is passed
-// to sink instead of being pushed onto a channel. A nil Tail, mp or sink panics.
+// to sink instead of being pushed onto a channel.
+//
+// Panics:
+//   - a nil Tail, mp or sink panics
+//   - a panic in mp is recovered and passed to sink as a [*PanicError]
+//   - a panic in sink is recovered and sink is called again with the [*PanicError]
+//   - a panic in that second call is not recovered
 func (tl Tail[T]) MapErrorSink[U any, M func(T) (U, error), S func(error)](mp M, sink S) Tail[U] {
 	assert(tl != nil, "pipe: Tail.MapErrorSink: nil %T", tl)
 	assert(mp != nil, "pipe: Tail.MapErrorSink: nil mp")
@@ -307,7 +365,11 @@ func (tl Tail[T]) MapErrorSink[U any, M func(T) (U, error), S func(error)](mp M,
 // the returned channel and calls sink independently, so values are emitted and errors sunk in the
 // order mp finishes, not the order they were pulled.
 //
-// A nil Tail, mp or sink panics.
+// Panics:
+//   - a nil Tail, mp or sink panics
+//   - a panic in mp is recovered and passed to sink as a [*PanicError]
+//   - a panic in sink is recovered and sink is called again with the [*PanicError]
+//   - a panic in that second call is not recovered
 func (tl Tail[T]) MapErrorSinkAsync[U any, M func(T) (U, error), S func(error)](workers int, mp M, sink S) Tail[U] {
 	assert(tl != nil, "pipe: Tail.MapErrorSinkAsync: nil %T", tl)
 	assert(mp != nil, "pipe: Tail.MapErrorSinkAsync: nil mp")
@@ -319,7 +381,10 @@ func (tl Tail[T]) MapErrorSinkAsync[U any, M func(T) (U, error), S func(error)](
 
 // Reduce is a blocking operation that calls reduce with each T pulled and the current accumulator,
 // starting from acc, and returns the final accumulator once this channel is closed and emptied.
-// A nil Tail or a nil reduce panics.
+//
+// Panics:
+//   - a nil Tail or a nil reduce panics
+//   - a panic in reduce is not recovered
 func (tl Tail[T]) Reduce[Acc any, R func(T, Acc) Acc](acc Acc, reduce R) Acc {
 	assert(tl != nil, "pipe: Tail.Reduce: nil %T", tl)
 	assert(reduce != nil, "pipe: Tail.Reduce: nil reduce")
@@ -331,7 +396,11 @@ func (tl Tail[T]) Reduce[Acc any, R func(T, Acc) Acc](acc Acc, reduce R) Acc {
 
 // ReduceAndEmit is a non-blocking operation that behaves as [Tail.Reduce] but pushes the final
 // accumulator onto the returned tail only channel of size 1 instead of returning it. The returned
-// channel is closed after the accumulator is pushed. A nil Tail or a nil reduce panics.
+// channel is closed after the accumulator is pushed.
+//
+// Panics:
+//   - a nil Tail or a nil reduce panics
+//   - a panic in reduce is not recovered
 func (tl Tail[T]) ReduceAndEmit[Acc any, R func(T, Acc) Acc](acc Acc, reduce R) Tail[Acc] {
 	assert(tl != nil, "pipe: Tail.ReduceAndEmit: nil %T", tl)
 	assert(reduce != nil, "pipe: Tail.ReduceAndEmit: nil reduce")
@@ -346,8 +415,14 @@ func (tl Tail[T]) ReduceAndEmit[Acc any, R func(T, Acc) Acc](acc Acc, reduce R) 
 // Window is a non-blocking operation that calls reduce with each T pulled and the current
 // accumulator. Every window duration the accumulator is pushed onto the returned tail only channel
 // of size 1 and replaced with a fresh one from acc. The final accumulator is pushed and the returned
-// channel closed after this channel is closed and emptied. A nil Tail, acc or reduce panics. A window
-// of zero or less panics.
+// channel closed after this channel is closed and emptied.
+//
+// Panics:
+//   - a nil Tail panics
+//   - a window of zero or less panics
+//   - a nil acc or reduce panics
+//   - a panic in acc is not recovered
+//   - a panic in reduce is not recovered
 func (tl Tail[T]) Window[Acc any, A func() Acc, R func(T, Acc) Acc](window time.Duration, acc A, reduce R) Tail[Acc] {
 	assert(tl != nil, "pipe: Tail.Window: nil %T", tl)
 	assert(window > 0, "pipe: Tail.Window: non-positive window %s", window)
@@ -362,8 +437,11 @@ func (tl Tail[T]) Window[Acc any, A func() Acc, R func(T, Acc) Acc](window time.
 // as this channel, and forwards each T onto the route whose match equals compare(T). A T matching no
 // route is forwarded onto orElse. Routes are returned in the order of matches. Duplicate matches each
 // return a channel but only the last one created for that match receives values and is closed. All
-// other returned channels are closed after this channel is closed and emptied. A nil Tail or a nil
-// compare panics.
+// other returned channels are closed after this channel is closed and emptied.
+//
+// Panics:
+//   - a nil Tail or a nil compare panics
+//   - a panic in compare is not recovered
 func (tl Tail[T]) Router[Cmp comparable, C func(T) Cmp](matches []Cmp, compare C) (routes []Tail[T], orElse Tail[T]) {
 	assert(tl != nil, "pipe: Tail.Router: nil %T", tl)
 	assert(compare != nil, "pipe: Tail.Router: nil compare")
@@ -385,7 +463,9 @@ func (tl Tail[T]) Router[Cmp comparable, C func(T) Cmp](matches []Cmp, compare C
 // routes and orElse independently, so values are emitted in the order compare finishes, not the
 // order they were pulled.
 //
-// A nil Tail or a nil compare panics.
+// Panics:
+//   - a nil Tail or a nil compare panics
+//   - a panic in compare is not recovered
 func (tl Tail[T]) RouterAsync[Cmp comparable, C func(T) Cmp](workers int, matches []Cmp, compare C) (routes []Tail[T], orElse Tail[T]) {
 	assert(tl != nil, "pipe: Tail.RouterAsync: nil %T", tl)
 	assert(compare != nil, "pipe: Tail.RouterAsync: nil compare")
@@ -400,8 +480,12 @@ func (tl Tail[T]) RouterAsync[Cmp comparable, C func(T) Cmp](workers int, matche
 }
 
 // RouterWithSink is a non-blocking operation that behaves as [Tail.Router] but a T matching no
-// route is passed to sink instead of being forwarded onto a channel. A nil Tail, compare or sink
-// panics.
+// route is passed to sink instead of being forwarded onto a channel.
+//
+// Panics:
+//   - a nil Tail, compare or sink panics
+//   - a panic in compare is not recovered
+//   - a panic in sink is not recovered
 func (tl Tail[T]) RouterWithSink[Cmp comparable, C func(T) Cmp, S func(T)](matches []Cmp, compare C, sink S) (routes []Tail[T]) {
 	assert(tl != nil, "pipe: Tail.RouterWithSink: nil %T", tl)
 	assert(compare != nil, "pipe: Tail.RouterWithSink: nil compare")
@@ -423,7 +507,10 @@ func (tl Tail[T]) RouterWithSink[Cmp comparable, C func(T) Cmp, S func(T)](match
 // the routes and calls sink independently, so values are emitted or sunk in the order compare
 // finishes, not the order they were pulled.
 //
-// A nil Tail, compare or sink panics.
+// Panics:
+//   - a nil Tail, compare or sink panics
+//   - a panic in compare is not recovered
+//   - a panic in sink is not recovered
 func (tl Tail[T]) RouterWithSinkAsync[Cmp comparable, C func(T) Cmp, S func(T)](workers int, matches []Cmp, compare C, sink S) (routes []Tail[T]) {
 	assert(tl != nil, "pipe: Tail.RouterWithSinkAsync: nil %T", tl)
 	assert(compare != nil, "pipe: Tail.RouterWithSinkAsync: nil compare")
@@ -450,8 +537,12 @@ func (tl Tail[T]) RoundRobin(count int) []Tail[T] {
 
 // Distribute is a non-blocking operation that creates count tail only channels of the same size as
 // this channel and forwards each T onto the channel at index choose(T). A count of less than 1
-// returns nil. A choose result outside 0 to count-1 panics. All returned channels are closed after
-// this channel is closed and emptied. A nil Tail or a nil choose panics.
+// returns nil. All returned channels are closed after this channel is closed and emptied.
+//
+// Panics:
+//   - a nil Tail or a nil choose panics
+//   - a panic in choose is not recovered
+//   - a choose result outside 0 to count-1 panics
 func (tl Tail[T]) Distribute[C func(T) int](count int, choose C) []Tail[T] {
 	assert(tl != nil, "pipe: Tail.Distribute: nil %T", tl)
 	assert(choose != nil, "pipe: Tail.Distribute: nil choose")
@@ -479,7 +570,10 @@ func (tl Tail[T]) Distribute[C func(T) int](count int, choose C) []Tail[T] {
 // the returned channels independently, so values are emitted in the order choose finishes, not the
 // order they were pulled.
 //
-// A nil Tail or a nil choose panics.
+// Panics:
+//   - a nil Tail or a nil choose panics
+//   - a panic in choose is not recovered
+//   - a choose result outside 0 to count-1 panics
 func (tl Tail[T]) DistributeAsync[C func(T) int](workers int, count int, choose C) []Tail[T] {
 	assert(tl != nil, "pipe: Tail.DistributeAsync: nil %T", tl)
 	assert(choose != nil, "pipe: Tail.DistributeAsync: nil choose")
@@ -499,7 +593,11 @@ func (tl Tail[T]) DistributeAsync[C func(T) int](workers int, count int, choose 
 }
 
 // Sink is a blocking operation that passes each T pulled to sink until this channel is closed and
-// emptied. A nil Tail or a nil sink panics.
+// emptied.
+//
+// Panics:
+//   - a nil Tail or a nil sink panics
+//   - a panic in sink is not recovered
 func (tl Tail[T]) Sink[S func(T)](sink S) {
 	assert(tl != nil, "pipe: Tail.Sink: nil %T", tl)
 	assert(sink != nil, "pipe: Tail.Sink: nil sink")
@@ -515,7 +613,9 @@ func (tl Tail[T]) Sink[S func(T)](sink S) {
 // Ordering is lost through SinkAsync. Each goroutine pulls from this channel and calls sink
 // independently, so sink calls overlap and finish in no fixed order.
 //
-// A nil Tail or a nil sink panics.
+// Panics:
+//   - a nil Tail or a nil sink panics
+//   - a panic in sink is not recovered
 func (tl Tail[T]) SinkAsync[S func(T)](workers int, sink S) {
 	assert(tl != nil, "pipe: Tail.SinkAsync: nil %T", tl)
 	assert(sink != nil, "pipe: Tail.SinkAsync: nil sink")
@@ -524,8 +624,11 @@ func (tl Tail[T]) SinkAsync[S func(T)](workers int, sink S) {
 
 // SinkError is a non-blocking operation that creates a goroutine passing each T pulled to sink. Each
 // error returned by sink is pushed onto the returned error tail only channel of the same size as
-// this channel. The returned channel is closed after this channel is closed and emptied. A nil Tail
-// or a nil sink panics.
+// this channel. The returned channel is closed after this channel is closed and emptied.
+//
+// Panics:
+//   - a nil Tail or a nil sink panics
+//   - a panic in sink is recovered and pushed onto the error channel as a [*PanicError]
 func (tl Tail[T]) SinkError[S func(T) error](sink S) Tail[error] {
 	assert(tl != nil, "pipe: Tail.SinkError: nil %T", tl)
 	assert(sink != nil, "pipe: Tail.SinkError: nil sink")
@@ -542,7 +645,9 @@ func (tl Tail[T]) SinkError[S func(T) error](sink S) Tail[error] {
 // the returned channel independently, so errors are emitted in the order sink finishes, not the
 // order values were pulled.
 //
-// A nil Tail or a nil sink panics.
+// Panics:
+//   - a nil Tail or a nil sink panics
+//   - a panic in sink is recovered and pushed onto the error channel as a [*PanicError]
 func (tl Tail[T]) SinkErrorAsync[S func(T) error](workers int, sink S) Tail[error] {
 	assert(tl != nil, "pipe: Tail.SinkErrorAsync: nil %T", tl)
 	assert(sink != nil, "pipe: Tail.SinkErrorAsync: nil sink")
@@ -552,14 +657,20 @@ func (tl Tail[T]) SinkErrorAsync[S func(T) error](workers int, sink S) Tail[erro
 }
 
 // SinkErrorSink is a blocking operation that behaves as [Tail.Sink] but sink may return an error.
-// Each error is passed to errSink. A nil Tail, sink or errSink panics.
+// Each error is passed to errSink.
+//
+// Panics:
+//   - a nil Tail, sink or errSink panics
+//   - a panic in sink is recovered and passed to errSink as a [*PanicError]
+//   - a panic in errSink is recovered and errSink is called again with the [*PanicError]
+//   - a panic in that second call is not recovered
 func (tl Tail[T]) SinkErrorSink[S func(T) error, E func(error)](sink S, errSink E) {
 	assert(tl != nil, "pipe: Tail.SinkErrorSink: nil %T", tl)
 	assert(sink != nil, "pipe: Tail.SinkErrorSink: nil sink")
 	assert(errSink != nil, "pipe: Tail.SinkErrorSink: nil errSink")
 	for t := range tl {
-		if err := sink(t); err != nil {
-			errSink(err)
+		if err := recoverErr(sink, t); err != nil {
+			recoverableSink(errSink, err)
 		}
 	}
 }
@@ -571,7 +682,11 @@ func (tl Tail[T]) SinkErrorSink[S func(T) error, E func(error)](sink S, errSink 
 // Ordering is lost through SinkErrorSinkAsync. Each goroutine pulls from this channel and calls
 // sink and errSink independently, so calls overlap and finish in no fixed order.
 //
-// A nil Tail, sink or errSink panics.
+// Panics:
+//   - a nil Tail, sink or errSink panics
+//   - a panic in sink is recovered and passed to errSink as a [*PanicError]
+//   - a panic in errSink is recovered and errSink is called again with the [*PanicError]
+//   - a panic in that second call is not recovered
 func (tl Tail[T]) SinkErrorSinkAsync[S func(T) error, E func(error)](workers int, sink S, errSink E) {
 	assert(tl != nil, "pipe: Tail.SinkErrorSinkAsync: nil %T", tl)
 	assert(sink != nil, "pipe: Tail.SinkErrorSinkAsync: nil sink")
@@ -581,7 +696,11 @@ func (tl Tail[T]) SinkErrorSinkAsync[S func(T) error, E func(error)](workers int
 
 // Tap is a non-blocking operation that passes each T pulled to tap and then forwards it onto the
 // returned tail only channel of the same size as this channel. The returned channel is closed after
-// this channel is closed and emptied. A nil Tail or a nil tap panics.
+// this channel is closed and emptied.
+//
+// Panics:
+//   - a nil Tail or a nil tap panics
+//   - a panic in tap is not recovered
 func (tl Tail[T]) Tap[Tp func(T)](tap Tp) Tail[T] {
 	assert(tl != nil, "pipe: Tail.Tap: nil %T", tl)
 	assert(tap != nil, "pipe: Tail.Tap: nil tap")
@@ -598,7 +717,9 @@ func (tl Tail[T]) Tap[Tp func(T)](tap Tp) Tail[T] {
 // returned channel independently, so values are emitted in the order tap finishes, not the order
 // they were pulled.
 //
-// A nil Tail or a nil tap panics.
+// Panics:
+//   - a nil Tail or a nil tap panics
+//   - a panic in tap is not recovered
 func (tl Tail[T]) TapAsync[Tp func(T)](workers int, tap Tp) Tail[T] {
 	assert(tl != nil, "pipe: Tail.TapAsync: nil %T", tl)
 	assert(tap != nil, "pipe: Tail.TapAsync: nil tap")
@@ -609,8 +730,11 @@ func (tl Tail[T]) TapAsync[Tp func(T)](workers int, tap Tp) Tail[T] {
 
 // TapError is a non-blocking operation that behaves as [Tail.Tap] but tap may return an error. Each
 // error is pushed onto the returned error tail only channel and the T is still forwarded. Both
-// returned channels are closed after this channel is closed and emptied. A nil Tail or a nil tap
-// panics.
+// returned channels are closed after this channel is closed and emptied.
+//
+// Panics:
+//   - a nil Tail or a nil tap panics
+//   - a panic in tap is recovered and pushed onto the error channel as a [*PanicError]
 func (tl Tail[T]) TapError[Tp func(T) error](tap Tp) (Tail[T], Tail[error]) {
 	assert(tl != nil, "pipe: Tail.TapError: nil %T", tl)
 	assert(tap != nil, "pipe: Tail.TapError: nil tap")
@@ -628,7 +752,9 @@ func (tl Tail[T]) TapError[Tp func(T) error](tap Tp) (Tail[T], Tail[error]) {
 // returned channels independently, so values and errors are emitted in the order tap finishes, not
 // the order they were pulled.
 //
-// A nil Tail or a nil tap panics.
+// Panics:
+//   - a nil Tail or a nil tap panics
+//   - a panic in tap is recovered and pushed onto the error channel as a [*PanicError]
 func (tl Tail[T]) TapErrorAsync[Tp func(T) error](workers int, tap Tp) (Tail[T], Tail[error]) {
 	assert(tl != nil, "pipe: Tail.TapErrorAsync: nil %T", tl)
 	assert(tap != nil, "pipe: Tail.TapErrorAsync: nil tap")
@@ -639,7 +765,13 @@ func (tl Tail[T]) TapErrorAsync[Tp func(T) error](workers int, tap Tp) (Tail[T],
 }
 
 // TapErrorSink is a non-blocking operation that behaves as [Tail.TapError] but each error is passed
-// to sink instead of being pushed onto a channel. A nil Tail, tap or sink panics.
+// to sink instead of being pushed onto a channel.
+//
+// Panics:
+//   - a nil Tail, tap or sink panics
+//   - a panic in tap is recovered and passed to sink as a [*PanicError]
+//   - a panic in sink is recovered and sink is called again with the [*PanicError]
+//   - a panic in that second call is not recovered
 func (tl Tail[T]) TapErrorSink[Tp func(T) error, S func(error)](tap Tp, sink S) Tail[T] {
 	assert(tl != nil, "pipe: Tail.TapErrorSink: nil %T", tl)
 	assert(tap != nil, "pipe: Tail.TapErrorSink: nil tap")
@@ -657,7 +789,11 @@ func (tl Tail[T]) TapErrorSink[Tp func(T) error, S func(error)](tap Tp, sink S) 
 // the returned channel and calls sink independently, so values are emitted and errors sunk in the
 // order tap finishes, not the order they were pulled.
 //
-// A nil Tail, tap or sink panics.
+// Panics:
+//   - a nil Tail, tap or sink panics
+//   - a panic in tap is recovered and passed to sink as a [*PanicError]
+//   - a panic in sink is recovered and sink is called again with the [*PanicError]
+//   - a panic in that second call is not recovered
 func (tl Tail[T]) TapErrorSinkAsync[Tp func(T) error, S func(error)](workers int, tap Tp, sink S) Tail[T] {
 	assert(tl != nil, "pipe: Tail.TapErrorSinkAsync: nil %T", tl)
 	assert(tap != nil, "pipe: Tail.TapErrorSinkAsync: nil tap")

@@ -10,19 +10,15 @@
 // second [Tail] carrying every error. The ErrorSink form passes every error to a sink function
 // instead.
 //
-// # Sources
+// Panics in the functions an operation calls are handled as follows:
 //
-// [Source], [SourceError], and [SourceErrorSink] build a [Tail] from a function that produces
-// values, call a closer when the source is finished, and stop early when the source returns [Done].
-//
-// # Async
-//
-// Operations with an Async form run their function across a number of worker goroutines pulling
-// from the same channel. With more than one worker, a slow call to the function holds up only its
-// own worker while the others keep pulling, so one operation does not block the rest. The trade off
-// is ordering. Workers push as they finish, so values leave an Async operation in the order the
-// function completes rather than the order they arrived. Nothing downstream restores that order, so
-// a chain that depends on arrival order either avoids the Async forms or reorders the values itself.
+//   - an operation with an error path recovers a panic in any function it calls, closer included,
+//     and delivers it on that path as a [*PanicError] carrying the panic value; the operation
+//     continues with the next value
+//   - an error sink that panics is called again with the [*PanicError]; a panic in that second call
+//     is not recovered
+//   - an operation without an error path recovers nothing; a panic in any function it calls, closer
+//     included, ends the program as an unrecovered panic in any goroutine does
 //
 // # Bad inputs
 //
@@ -35,6 +31,12 @@
 //   - a nil function argument
 //   - a window of zero or less on [Tail.Window]
 //
-// [Tail.TryPull] and [Head.TryPush] return false on a nil receiver instead of panicking. A nil
-// closer passed to [Source], [SourceError], or [SourceErrorSink] is treated as a no-op.
+// # Async
+//
+// Operations with an Async form run their function across a number of worker goroutines pulling
+// from the same channel. With more than one worker, a slow call to the function holds up only its
+// own worker while the others keep pulling, so one operation does not block the rest. The trade off
+// is ordering. Workers push as they finish, so values leave an Async operation in the order the
+// function completes rather than the order they arrived. Nothing downstream restores that order, so
+// a chain that depends on arrival order either avoids the Async forms or reorders the values itself.
 package pipe

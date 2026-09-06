@@ -2,6 +2,7 @@ package pipe
 
 import (
 	"errors"
+	"fmt"
 	"sync"
 	"time"
 )
@@ -14,6 +15,87 @@ const RepeatForever = -1
 // loop early. Done is never pushed onto a channel or passed to a sink. The source's closer is called
 // and the returned channels are closed as if repeat were exhausted.
 var Done = errors.New("pipe: source done")
+
+// PanicError is the error emitted on an operation's error path when the function the operation calls
+// panics. Value is the recovered panic value.
+type PanicError struct {
+	Value any
+}
+
+// Error returns "pipe: recovered panic: " followed by the formatted [PanicError.Value].
+func (e *PanicError) Error() string {
+	return fmt.Sprintf("pipe: recovered panic: %v", e.Value)
+}
+
+// Unwrap returns [PanicError.Value] when it is an error, otherwise nil.
+func (e *PanicError) Unwrap() error {
+	if err, ok := e.Value.(error); ok {
+		return err
+	}
+	return nil
+}
+
+// recoverFilter calls filter with t. A panic in filter is recovered and returned as a [*PanicError].
+func recoverFilter[T any, F func(T) (bool, error)](filter F, t T) (keep bool, err error) {
+	defer func() {
+		if v := recover(); v != nil {
+			err = &PanicError{Value: v}
+		}
+	}()
+	return filter(t)
+}
+
+// recoverMap calls mp with t. A panic in mp is recovered and returned as a [*PanicError].
+func recoverMap[T any, U any, M func(T) (U, error)](mp M, t T) (u U, err error) {
+	defer func() {
+		if v := recover(); v != nil {
+			err = &PanicError{Value: v}
+		}
+	}()
+	return mp(t)
+}
+
+// recoverErr calls fn with t. A panic in fn is recovered and returned as a [*PanicError].
+func recoverErr[T any, F func(T) error](fn F, t T) (err error) {
+	defer func() {
+		if v := recover(); v != nil {
+			err = &PanicError{Value: v}
+		}
+	}()
+	return fn(t)
+}
+
+// recoverSource calls source. A panic in source is recovered and returned as a [*PanicError].
+func recoverSource[T any, S func() (T, error)](source S) (t T, err error) {
+	defer func() {
+		if v := recover(); v != nil {
+			err = &PanicError{Value: v}
+		}
+	}()
+	return source()
+}
+
+// recoverCloser calls closer. A panic in closer is recovered and returned as a [*PanicError].
+func recoverCloser[C func()](closer C) (err error) {
+	defer func() {
+		if v := recover(); v != nil {
+			err = &PanicError{Value: v}
+		}
+	}()
+	closer()
+	return nil
+}
+
+// recoverableSink calls sink with err. A panic in sink is recovered and sink is called again with the
+// [*PanicError]. A panic in that second call is not recovered.
+func recoverableSink[S func(error)](sink S, err error) {
+	defer func() {
+		if v := recover(); v != nil {
+			sink(&PanicError{Value: v})
+		}
+	}()
+	sink(err)
+}
 
 // fanInCoordinator creates len(tails)-1 fanInWorkers then demotes itself to a fanInWorker. Passing a
 // nil head only channel or fewer than 1 tail only channel panics. This closes the passed head only
@@ -109,13 +191,14 @@ func filterAsyncWorker[T any, F func(T) bool](tail Tail[T], head Head[T], wg *sy
 }
 
 // filterErrorWorker behaves as filterWorker but filter may return an error. Each error is pushed onto
-// the passed error head only channel and the value is discarded. This closes both passed head only
+// the passed error head only channel and the value is discarded. A panic in filter is recovered and
+// pushed onto the error head only channel as a [*PanicError]. This closes both passed head only
 // channels after the tail only channel is closed and emptied.
 func filterErrorWorker[T any, F func(T) (bool, error)](tail Tail[T], head Head[T], err Head[error], filter F) {
 	defer func() { close(head); close(err) }()
 
 	for t := range tail {
-		if keep, er := filter(t); er != nil {
+		if keep, er := recoverFilter(filter, t); er != nil {
 			err <- er
 		} else if keep {
 			head <- t
@@ -150,7 +233,7 @@ func filterErrorAsyncWorker[T any, F func(T) (bool, error)](tail Tail[T], head H
 	defer wg.Done()
 
 	for t := range tail {
-		if keep, er := filter(t); er != nil {
+		if keep, er := recoverFilter(filter, t); er != nil {
 			err <- er
 		} else if keep {
 			head <- t
@@ -160,12 +243,17 @@ func filterErrorAsyncWorker[T any, F func(T) (bool, error)](tail Tail[T], head H
 
 // filterErrorSinkWorker behaves as filterErrorWorker but each error is passed to sink instead of
 // being pushed onto a channel.
+//
+// Panics:
+//   - a panic in filter is recovered and passed to sink as a [*PanicError]
+//   - a panic in sink is recovered and sink is called again with the [*PanicError]
+//   - a panic in that second call is not recovered
 func filterErrorSinkWorker[T any, F func(T) (bool, error), S func(error)](tail Tail[T], head Head[T], filter F, sink S) {
 	defer close(head)
 
 	for t := range tail {
-		if keep, er := filter(t); er != nil {
-			sink(er)
+		if keep, er := recoverFilter(filter, t); er != nil {
+			recoverableSink(sink, er)
 		} else if keep {
 			head <- t
 		}
@@ -199,8 +287,8 @@ func filterErrorSinkAsyncWorker[T any, F func(T) (bool, error), S func(error)](t
 	defer wg.Done()
 
 	for t := range tail {
-		if keep, er := filter(t); er != nil {
-			sink(er)
+		if keep, er := recoverFilter(filter, t); er != nil {
+			recoverableSink(sink, er)
 		} else if keep {
 			head <- t
 		}
@@ -252,13 +340,14 @@ func mapAsyncWorker[T any, U any, M func(T) U](tail Tail[T], head Head[U], wg *s
 }
 
 // mapErrorWorker behaves as mapWorker but mp may return an error. Each error is pushed onto the
-// passed error head only channel and no value is pushed for that input. This closes both passed head
-// only channels after the tail only channel is closed and emptied.
+// passed error head only channel and no value is pushed for that input. A panic in mp is recovered
+// and pushed onto the error head only channel as a [*PanicError]. This closes both passed head only
+// channels after the tail only channel is closed and emptied.
 func mapErrorWorker[T any, U any, M func(T) (U, error)](tail Tail[T], head Head[U], err Head[error], mp M) {
 	defer func() { close(head); close(err) }()
 
 	for t := range tail {
-		if n, er := mp(t); er != nil {
+		if n, er := recoverMap(mp, t); er != nil {
 			err <- er
 		} else {
 			head <- n
@@ -295,7 +384,7 @@ func mapErrorAsyncWorker[T any, U any, M func(T) (U, error)](tail Tail[T], head 
 	defer wg.Done()
 
 	for t := range tail {
-		if n, er := mp(t); er != nil {
+		if n, er := recoverMap(mp, t); er != nil {
 			err <- er
 		} else {
 			head <- n
@@ -305,12 +394,17 @@ func mapErrorAsyncWorker[T any, U any, M func(T) (U, error)](tail Tail[T], head 
 
 // mapErrorSinkWorker behaves as mapErrorWorker but each error is passed to sink instead of being
 // pushed onto a channel.
+//
+// Panics:
+//   - a panic in mp is recovered and passed to sink as a [*PanicError]
+//   - a panic in sink is recovered and sink is called again with the [*PanicError]
+//   - a panic in that second call is not recovered
 func mapErrorSinkWorker[T any, U any, M func(T) (U, error), S func(error)](tail Tail[T], head Head[U], mp M, sink S) {
 	defer close(head)
 
 	for t := range tail {
-		if n, er := mp(t); er != nil {
-			sink(er)
+		if n, er := recoverMap(mp, t); er != nil {
+			recoverableSink(sink, er)
 		} else {
 			head <- n
 		}
@@ -344,8 +438,8 @@ func mapErrorSinkAsyncCoordinator[T any, U any, M func(T) (U, error), S func(err
 func mapErrorSinkAsyncWorker[T any, U any, M func(T) (U, error), S func(error)](tail Tail[T], head Head[U], wg *sync.WaitGroup, mp M, sink S) {
 	defer wg.Done()
 	for t := range tail {
-		if n, er := mp(t); er != nil {
-			sink(er)
+		if n, er := recoverMap(mp, t); er != nil {
+			recoverableSink(sink, er)
 		} else {
 			head <- n
 		}
@@ -625,12 +719,13 @@ func tapAsyncWorker[T any, Tp func(T)](tail Tail[T], head Head[T], wg *sync.Wait
 }
 
 // tapErrorWorker behaves as tapWorker but tap may return an error. Each error is pushed onto the
-// passed error head only channel and the value is still forwarded. This closes both passed head only
+// passed error head only channel and the value is still forwarded. A panic in tap is recovered and
+// pushed onto the error head only channel as a [*PanicError]. This closes both passed head only
 // channels after the tail only channel is closed and emptied.
 func tapErrorWorker[T any, Tp func(T) error](tail Tail[T], head Head[T], err Head[error], tap Tp) {
 	defer func() { close(head); close(err) }()
 	for t := range tail {
-		if er := tap(t); er != nil {
+		if er := recoverErr(tap, t); er != nil {
 			err <- er
 		}
 		head <- t
@@ -663,7 +758,7 @@ func tapErrorAsyncCoordinator[T any, Tp func(T) error](tail Tail[T], head Head[T
 func tapErrorAsyncWorker[T any, Tp func(T) error](tail Tail[T], head Head[T], err Head[error], wg *sync.WaitGroup, tap Tp) {
 	defer wg.Done()
 	for t := range tail {
-		if er := tap(t); er != nil {
+		if er := recoverErr(tap, t); er != nil {
 			err <- er
 		}
 		head <- t
@@ -672,11 +767,16 @@ func tapErrorAsyncWorker[T any, Tp func(T) error](tail Tail[T], head Head[T], er
 
 // tapErrorSinkWorker behaves as tapErrorWorker but each error is passed to sink instead of being
 // pushed onto a channel.
-func tapErrorSinkWorker[T any, Tp func(T) error, S func(error)](tail Tail[T], head Head[T], mp Tp, sink S) {
+//
+// Panics:
+//   - a panic in tap is recovered and passed to sink as a [*PanicError]
+//   - a panic in sink is recovered and sink is called again with the [*PanicError]
+//   - a panic in that second call is not recovered
+func tapErrorSinkWorker[T any, Tp func(T) error, S func(error)](tail Tail[T], head Head[T], tap Tp, sink S) {
 	defer close(head)
 	for t := range tail {
-		if er := mp(t); er != nil {
-			sink(er)
+		if er := recoverErr(tap, t); er != nil {
+			recoverableSink(sink, er)
 		}
 		head <- t
 	}
@@ -708,8 +808,8 @@ func tapErrorSinkAsyncCoordinator[T any, Tp func(T) error, S func(error)](tail T
 func tapErrorSinkAsyncWorker[T any, Tp func(T) error, S func(error)](tail Tail[T], head Head[T], wg *sync.WaitGroup, tap Tp, sink S) {
 	defer wg.Done()
 	for t := range tail {
-		if er := tap(t); er != nil {
-			sink(er)
+		if er := recoverErr(tap, t); er != nil {
+			recoverableSink(sink, er)
 		}
 		head <- t
 	}
@@ -743,12 +843,13 @@ func sinkAsyncWorker[T any, S func(T)](tail Tail[T], wg *sync.WaitGroup, sink S)
 }
 
 // sinkErrorWorker iterates over the passed tail only channel passing each value to sink. Each error
-// returned by sink is pushed onto the passed error head only channel. This closes the passed error
-// head only channel after the tail only channel is closed and emptied.
+// returned by sink is pushed onto the passed error head only channel. A panic in sink is recovered
+// and pushed onto the error head only channel as a [*PanicError]. This closes the passed error head
+// only channel after the tail only channel is closed and emptied.
 func sinkErrorWorker[T any, S func(T) error](tail Tail[T], err Head[error], sink S) {
 	defer close(err)
 	for t := range tail {
-		if er := sink(t); er != nil {
+		if er := recoverErr(sink, t); er != nil {
 			err <- er
 		}
 	}
@@ -780,7 +881,7 @@ func sinkErrorAsyncCoordinator[T any, S func(T) error](tail Tail[T], err Head[er
 func sinkErrorAsyncWorker[T any, S func(T) error](tail Tail[T], err Head[error], wg *sync.WaitGroup, sink S) {
 	defer wg.Done()
 	for t := range tail {
-		if er := sink(t); er != nil {
+		if er := recoverErr(sink, t); er != nil {
 			err <- er
 		}
 	}
@@ -807,11 +908,16 @@ func sinkErrorSinkAsyncCoordinator[T any, S func(T) error, E func(error)](tail T
 
 // sinkErrorSinkAsyncWorker behaves as sinkAsyncWorker but sink may return an error. Each error is
 // passed to errSink.
+//
+// Panics:
+//   - a panic in sink is recovered and passed to errSink as a [*PanicError]
+//   - a panic in errSink is recovered and errSink is called again with the [*PanicError]
+//   - a panic in that second call is not recovered
 func sinkErrorSinkAsyncWorker[T any, S func(T) error, E func(error)](tail Tail[T], wg *sync.WaitGroup, sink S, errSink E) {
 	defer wg.Done()
 	for t := range tail {
-		if er := sink(t); er != nil {
-			errSink(er)
+		if er := recoverErr(sink, t); er != nil {
+			recoverableSink(errSink, er)
 		}
 	}
 }
@@ -839,14 +945,23 @@ func sourceWorker[T any, S func() T, C func()](head Head[T], repeat int, source 
 // the passed error head only channel and no value is pushed for that call. Returning [Done] from
 // source ends the loop as if repeat were exhausted and [Done] is not pushed. This then calls closer
 // and closes both passed head only channels.
+//
+// Panics:
+//   - a panic in source is recovered and pushed onto the error head only channel as a [*PanicError]
+//   - a panic in closer is recovered and pushed onto the error head only channel as a [*PanicError]
 func sourceErrorWorker[T any, S func() (T, error), C func()](head Head[T], err Head[error], repeat int, source S, closer C) {
-	defer func() { close(err); close(head) }()
-	defer closer()
+	defer func() {
+		if er := recoverCloser(closer); er != nil {
+			err <- er
+		}
+		close(err)
+		close(head)
+	}()
 
 	switch repeat {
 	case RepeatForever:
 		for {
-			if v, er := source(); errors.Is(er, Done) {
+			if v, er := recoverSource(source); errors.Is(er, Done) {
 				return
 			} else if er != nil {
 				err <- er
@@ -856,7 +971,7 @@ func sourceErrorWorker[T any, S func() (T, error), C func()](head Head[T], err H
 		}
 	default:
 		for ; repeat > 0; repeat-- {
-			if v, er := source(); errors.Is(er, Done) {
+			if v, er := recoverSource(source); errors.Is(er, Done) {
 				return
 			} else if er != nil {
 				err <- er
@@ -869,27 +984,37 @@ func sourceErrorWorker[T any, S func() (T, error), C func()](head Head[T], err H
 
 // sourceErrorSinkWorker behaves as sourceErrorWorker but each error is passed to sink instead of
 // being pushed onto a channel. [Done] is not passed to sink.
+//
+// Panics:
+//   - a panic in source is recovered and passed to sink as a [*PanicError]
+//   - a panic in closer is recovered and passed to sink as a [*PanicError]
+//   - a panic in sink is recovered and sink is called again with the [*PanicError]
+//   - a panic in that second call is not recovered
 func sourceErrorSinkWorker[T any, S func() (T, error), C func(), E func(error)](head Head[T], repeat int, source S, closer C, sink E) {
-	defer close(head)
-	defer closer()
+	defer func() {
+		if err := recoverCloser(closer); err != nil {
+			recoverableSink(sink, err)
+		}
+		close(head)
+	}()
 
 	switch repeat {
 	case RepeatForever:
 		for {
-			if v, err := source(); errors.Is(err, Done) {
+			if v, err := recoverSource(source); errors.Is(err, Done) {
 				return
 			} else if err != nil {
-				sink(err)
+				recoverableSink(sink, err)
 			} else {
 				head <- v
 			}
 		}
 	default:
 		for ; repeat > 0; repeat-- {
-			if v, err := source(); errors.Is(err, Done) {
+			if v, err := recoverSource(source); errors.Is(err, Done) {
 				return
 			} else if err != nil {
-				sink(err)
+				recoverableSink(sink, err)
 			} else {
 				head <- v
 			}

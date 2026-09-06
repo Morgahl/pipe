@@ -16,6 +16,89 @@ import (
 
 var errBoom = errors.New("boom")
 
+// keepPanicOnTwo keeps every value but 2, which panics.
+func keepPanicOnTwo(i int) (bool, error) {
+	if i == 2 {
+		panic("boom")
+	}
+	return true, nil
+}
+
+// doublePanicOnTwo doubles every value but 2, which panics.
+func doublePanicOnTwo(i int) (int, error) {
+	if i == 2 {
+		panic("boom")
+	}
+	return i * 2, nil
+}
+
+// nilPanicOnTwo returns nil for every value but 2, which panics.
+func nilPanicOnTwo(i int) error {
+	if i == 2 {
+		panic("boom")
+	}
+	return nil
+}
+
+// requirePanicError asserts err is a [*pipe.PanicError] recovered from panic(value).
+func requirePanicError(t *testing.T, err error, value string) {
+	t.Helper()
+	require := require.New(t)
+	var perr *pipe.PanicError
+	require.ErrorAs(err, &perr)
+	require.Equal(value, perr.Value)
+	require.EqualError(err, "pipe: recovered panic: "+value)
+}
+
+// panicOnBoom returns a sink that panics with "sink boom" on errBoom and appends every other error
+// to sunk.
+func panicOnBoom(sunk *[]error) func(error) {
+	return func(err error) {
+		if errors.Is(err, errBoom) {
+			panic("sink boom")
+		}
+		*sunk = append(*sunk, err)
+	}
+}
+
+// panicOnBoomChan behaves as panicOnBoom but sends every other error on sunk.
+func panicOnBoomChan(sunk chan<- error) func(error) {
+	return func(err error) {
+		if errors.Is(err, errBoom) {
+			panic("sink boom")
+		}
+		sunk <- err
+	}
+}
+
+func TestPanicError(t *testing.T) {
+	t.Run("error", func(t *testing.T) {
+		err := &pipe.PanicError{Value: "boom"}
+		require.EqualError(t, err, "pipe: recovered panic: boom")
+	})
+
+	t.Run("unwrapNonError", func(t *testing.T) {
+		err := &pipe.PanicError{Value: "boom"}
+		require.Nil(t, err.Unwrap())
+	})
+
+	t.Run("unwrapError", func(t *testing.T) {
+		require := require.New(t)
+		err := &pipe.PanicError{Value: errBoom}
+		require.Equal(errBoom, err.Unwrap())
+		require.ErrorIs(err, errBoom)
+		require.EqualError(err, "pipe: recovered panic: boom")
+	})
+
+	t.Run("errorsAs", func(t *testing.T) {
+		require := require.New(t)
+		err := fmt.Errorf("wrap: %w", &pipe.PanicError{Value: 7})
+		var perr *pipe.PanicError
+		require.ErrorAs(err, &perr)
+		require.Equal(7, perr.Value)
+	})
+}
+
 func TestTailPull(t *testing.T) {
 	t.Run("value", func(t *testing.T) {
 		head, tail := pipe.New[int](1)
@@ -456,6 +539,47 @@ func TestSourceError(t *testing.T) {
 		require.Equal(1, closes, "closer calls")
 	})
 
+	t.Run("panicRecovered", func(t *testing.T) {
+		require := require.New(t)
+		calls, closes := 0, 0
+		out, errs := pipe.SourceError(3, 3, func() (int, error) {
+			calls++
+			if calls == 2 {
+				panic("boom")
+			}
+			return calls, nil
+		}, func() { closes++ })
+		var got []int
+		for v := range out {
+			got = append(got, v)
+		}
+		var gotErrs []error
+		for err := range errs {
+			gotErrs = append(gotErrs, err)
+		}
+		require.Equal([]int{1, 3}, got)
+		require.Len(gotErrs, 1)
+		requirePanicError(t, gotErrs[0], "boom")
+		require.Equal(1, closes, "closer calls")
+	})
+
+	t.Run("closerPanicRecovered", func(t *testing.T) {
+		require := require.New(t)
+		calls := 0
+		out, errs := pipe.SourceError(3, 3, func() (int, error) { calls++; return calls, nil }, func() { panic("boom") })
+		var got []int
+		for v := range out {
+			got = append(got, v)
+		}
+		var gotErrs []error
+		for err := range errs {
+			gotErrs = append(gotErrs, err)
+		}
+		require.Equal([]int{1, 2, 3}, got)
+		require.Len(gotErrs, 1)
+		requirePanicError(t, gotErrs[0], "boom")
+	})
+
 	t.Run("nilSourcePanic", func(t *testing.T) {
 		require.PanicsWithValue(t, "pipe: SourceError: nil source", func() {
 			pipe.SourceError(3, 1, (func() (int, error))(nil), func() {})
@@ -570,6 +694,62 @@ func TestSourceErrorSink(t *testing.T) {
 		require.Empty(sunk)
 		require.Equal(3, calls, "source calls")
 		require.Equal(1, closes, "closer calls")
+	})
+
+	t.Run("panicRecovered", func(t *testing.T) {
+		require := require.New(t)
+		calls, closes := 0, 0
+		var sunk []error
+		out := pipe.SourceErrorSink(3, 3, func() (int, error) {
+			calls++
+			if calls == 2 {
+				panic("boom")
+			}
+			return calls, nil
+		}, func() { closes++ }, func(err error) { sunk = append(sunk, err) })
+		var got []int
+		for v := range out {
+			got = append(got, v)
+		}
+		require.Equal([]int{1, 3}, got)
+		require.Len(sunk, 1)
+		requirePanicError(t, sunk[0], "boom")
+		require.Equal(1, closes, "closer calls")
+	})
+
+	t.Run("sinkPanicRecovered", func(t *testing.T) {
+		require := require.New(t)
+		calls, closes := 0, 0
+		var sunk []error
+		out := pipe.SourceErrorSink(3, 3, func() (int, error) {
+			calls++
+			if calls == 2 {
+				return 0, errBoom
+			}
+			return calls, nil
+		}, func() { closes++ }, panicOnBoom(&sunk))
+		var got []int
+		for v := range out {
+			got = append(got, v)
+		}
+		require.Equal([]int{1, 3}, got)
+		require.Len(sunk, 1)
+		requirePanicError(t, sunk[0], "sink boom")
+		require.Equal(1, closes, "closer calls")
+	})
+
+	t.Run("closerPanicRecovered", func(t *testing.T) {
+		require := require.New(t)
+		calls := 0
+		var sunk []error
+		out := pipe.SourceErrorSink(3, 3, func() (int, error) { calls++; return calls, nil }, func() { panic("boom") }, func(err error) { sunk = append(sunk, err) })
+		var got []int
+		for v := range out {
+			got = append(got, v)
+		}
+		require.Equal([]int{1, 2, 3}, got)
+		require.Len(sunk, 1)
+		requirePanicError(t, sunk[0], "boom")
 	})
 
 	t.Run("nilSourcePanic", func(t *testing.T) {
@@ -802,6 +982,27 @@ func TestTailFilterError(t *testing.T) {
 		require.Equal([]error{errBoom}, gotErrs)
 	})
 
+	t.Run("panicRecovered", func(t *testing.T) {
+		require := require.New(t)
+		head, tail := pipe.New[int](3)
+		head.Push(1)
+		head.Push(2)
+		head.Push(3)
+		head.Close()
+		out, errs := tail.FilterError(keepPanicOnTwo)
+		var got []int
+		for v := range out {
+			got = append(got, v)
+		}
+		var gotErrs []error
+		for err := range errs {
+			gotErrs = append(gotErrs, err)
+		}
+		require.Equal([]int{1, 3}, got)
+		require.Len(gotErrs, 1)
+		requirePanicError(t, gotErrs[0], "boom")
+	})
+
 	t.Run("nilTailPanic", func(t *testing.T) {
 		var tail pipe.Tail[int]
 		require.PanicsWithValue(t, "pipe: Tail.FilterError: nil pipe.Tail[int]", func() { tail.FilterError(keepOddErrOnFour) })
@@ -867,6 +1068,28 @@ func TestTailFilterErrorAsync(t *testing.T) {
 		require.False(ok, "got an error, want closed")
 	})
 
+	t.Run("panicRecovered", func(t *testing.T) {
+		require := require.New(t)
+		head, tail := pipe.New[int](3)
+		head.Push(1)
+		head.Push(2)
+		head.Push(3)
+		head.Close()
+		out, errs := tail.FilterErrorAsync(4, keepPanicOnTwo)
+		var got []int
+		for v := range out {
+			got = append(got, v)
+		}
+		var gotErrs []error
+		for err := range errs {
+			gotErrs = append(gotErrs, err)
+		}
+		slices.Sort(got)
+		require.Equal([]int{1, 3}, got)
+		require.Len(gotErrs, 1)
+		requirePanicError(t, gotErrs[0], "boom")
+	})
+
 	t.Run("nilTailPanic", func(t *testing.T) {
 		var tail pipe.Tail[int]
 		require.PanicsWithValue(t, "pipe: Tail.FilterErrorAsync: nil pipe.Tail[int]", func() { tail.FilterErrorAsync(4, keepOddErrOnFour) })
@@ -906,6 +1129,42 @@ func TestTailFilterErrorSink(t *testing.T) {
 		}
 		require.Equal([]int{1, 3}, got)
 		require.Equal([]error{errBoom}, sunk)
+	})
+
+	t.Run("panicRecovered", func(t *testing.T) {
+		require := require.New(t)
+		head, tail := pipe.New[int](3)
+		head.Push(1)
+		head.Push(2)
+		head.Push(3)
+		head.Close()
+		var sunk []error
+		out := tail.FilterErrorSink(keepPanicOnTwo, func(err error) { sunk = append(sunk, err) })
+		var got []int
+		for v := range out {
+			got = append(got, v)
+		}
+		require.Equal([]int{1, 3}, got)
+		require.Len(sunk, 1)
+		requirePanicError(t, sunk[0], "boom")
+	})
+
+	t.Run("sinkPanicRecovered", func(t *testing.T) {
+		require := require.New(t)
+		head, tail := pipe.New[int](4)
+		for i := 1; i <= 4; i++ {
+			head.Push(i)
+		}
+		head.Close()
+		var sunk []error
+		out := tail.FilterErrorSink(keepOddErrOnFour, panicOnBoom(&sunk))
+		var got []int
+		for v := range out {
+			got = append(got, v)
+		}
+		require.Equal([]int{1, 3}, got)
+		require.Len(sunk, 1)
+		requirePanicError(t, sunk[0], "sink boom")
 	})
 
 	t.Run("nilTailPanic", func(t *testing.T) {
@@ -975,6 +1234,44 @@ func TestTailFilterErrorSinkAsync(t *testing.T) {
 		}
 		require.Equal([]int{1, 2, 3}, got)
 		require.Empty(sunk)
+	})
+
+	t.Run("panicRecovered", func(t *testing.T) {
+		require := require.New(t)
+		head, tail := pipe.New[int](3)
+		head.Push(1)
+		head.Push(2)
+		head.Push(3)
+		head.Close()
+		sunk := make(chan error, 3)
+		out := tail.FilterErrorSinkAsync(4, keepPanicOnTwo, func(err error) { sunk <- err })
+		var got []int
+		for v := range out {
+			got = append(got, v)
+		}
+		slices.Sort(got)
+		require.Equal([]int{1, 3}, got)
+		require.Len(sunk, 1)
+		requirePanicError(t, <-sunk, "boom")
+	})
+
+	t.Run("sinkPanicRecovered", func(t *testing.T) {
+		require := require.New(t)
+		head, tail := pipe.New[int](4)
+		for i := 1; i <= 4; i++ {
+			head.Push(i)
+		}
+		head.Close()
+		sunk := make(chan error, 4)
+		out := tail.FilterErrorSinkAsync(4, keepOddErrOnFour, panicOnBoomChan(sunk))
+		var got []int
+		for v := range out {
+			got = append(got, v)
+		}
+		slices.Sort(got)
+		require.Equal([]int{1, 3}, got)
+		require.Len(sunk, 1)
+		requirePanicError(t, <-sunk, "sink boom")
 	})
 
 	t.Run("nilTailPanic", func(t *testing.T) {
@@ -1144,6 +1441,40 @@ func TestTailMapError(t *testing.T) {
 		require.Equal([]error{errBoom}, gotErrs)
 	})
 
+	t.Run("panicRecovered", func(t *testing.T) {
+		require := require.New(t)
+		head, tail := pipe.New[int](3)
+		head.Push(1)
+		head.Push(2)
+		head.Push(3)
+		head.Close()
+		out, errs := tail.MapError(doublePanicOnTwo)
+		var got []int
+		for v := range out {
+			got = append(got, v)
+		}
+		var gotErrs []error
+		for err := range errs {
+			gotErrs = append(gotErrs, err)
+		}
+		require.Equal([]int{2, 6}, got)
+		require.Len(gotErrs, 1)
+		requirePanicError(t, gotErrs[0], "boom")
+	})
+
+	t.Run("panicErrorValue", func(t *testing.T) {
+		require := require.New(t)
+		head, tail := pipe.New[int](1)
+		head.Push(1)
+		head.Close()
+		_, errs := tail.MapError(func(int) (int, error) { panic(errBoom) })
+		err := errs.Pull()
+		require.ErrorIs(err, errBoom)
+		var perr *pipe.PanicError
+		require.ErrorAs(err, &perr)
+		require.Equal(errBoom, perr.Value)
+	})
+
 	t.Run("nilTailPanic", func(t *testing.T) {
 		var tail pipe.Tail[int]
 		require.PanicsWithValue(t, "pipe: Tail.MapError: nil pipe.Tail[int]", func() { tail.MapError(doubleErrOnTwo) })
@@ -1209,6 +1540,28 @@ func TestTailMapErrorAsync(t *testing.T) {
 		require.False(ok, "got an error, want closed")
 	})
 
+	t.Run("panicRecovered", func(t *testing.T) {
+		require := require.New(t)
+		head, tail := pipe.New[int](3)
+		head.Push(1)
+		head.Push(2)
+		head.Push(3)
+		head.Close()
+		out, errs := tail.MapErrorAsync(4, doublePanicOnTwo)
+		var got []int
+		for v := range out {
+			got = append(got, v)
+		}
+		var gotErrs []error
+		for err := range errs {
+			gotErrs = append(gotErrs, err)
+		}
+		slices.Sort(got)
+		require.Equal([]int{2, 6}, got)
+		require.Len(gotErrs, 1)
+		requirePanicError(t, gotErrs[0], "boom")
+	})
+
 	t.Run("nilTailPanic", func(t *testing.T) {
 		var tail pipe.Tail[int]
 		require.PanicsWithValue(t, "pipe: Tail.MapErrorAsync: nil pipe.Tail[int]", func() { tail.MapErrorAsync(4, doubleErrOnTwo) })
@@ -1248,6 +1601,42 @@ func TestTailMapErrorSink(t *testing.T) {
 		}
 		require.Equal([]int{2, 6}, got)
 		require.Equal([]error{errBoom}, sunk)
+	})
+
+	t.Run("panicRecovered", func(t *testing.T) {
+		require := require.New(t)
+		head, tail := pipe.New[int](3)
+		head.Push(1)
+		head.Push(2)
+		head.Push(3)
+		head.Close()
+		var sunk []error
+		out := tail.MapErrorSink(doublePanicOnTwo, func(err error) { sunk = append(sunk, err) })
+		var got []int
+		for v := range out {
+			got = append(got, v)
+		}
+		require.Equal([]int{2, 6}, got)
+		require.Len(sunk, 1)
+		requirePanicError(t, sunk[0], "boom")
+	})
+
+	t.Run("sinkPanicRecovered", func(t *testing.T) {
+		require := require.New(t)
+		head, tail := pipe.New[int](3)
+		head.Push(1)
+		head.Push(2)
+		head.Push(3)
+		head.Close()
+		var sunk []error
+		out := tail.MapErrorSink(doubleErrOnTwo, panicOnBoom(&sunk))
+		var got []int
+		for v := range out {
+			got = append(got, v)
+		}
+		require.Equal([]int{2, 6}, got)
+		require.Len(sunk, 1)
+		requirePanicError(t, sunk[0], "sink boom")
 	})
 
 	t.Run("nilTailPanic", func(t *testing.T) {
@@ -1319,6 +1708,44 @@ func TestTailMapErrorSinkAsync(t *testing.T) {
 		require.Empty(sunk)
 	})
 
+	t.Run("panicRecovered", func(t *testing.T) {
+		require := require.New(t)
+		head, tail := pipe.New[int](3)
+		head.Push(1)
+		head.Push(2)
+		head.Push(3)
+		head.Close()
+		sunk := make(chan error, 3)
+		out := tail.MapErrorSinkAsync(4, doublePanicOnTwo, func(err error) { sunk <- err })
+		var got []int
+		for v := range out {
+			got = append(got, v)
+		}
+		slices.Sort(got)
+		require.Equal([]int{2, 6}, got)
+		require.Len(sunk, 1)
+		requirePanicError(t, <-sunk, "boom")
+	})
+
+	t.Run("sinkPanicRecovered", func(t *testing.T) {
+		require := require.New(t)
+		head, tail := pipe.New[int](3)
+		head.Push(1)
+		head.Push(2)
+		head.Push(3)
+		head.Close()
+		sunk := make(chan error, 3)
+		out := tail.MapErrorSinkAsync(4, doubleErrOnTwo, panicOnBoomChan(sunk))
+		var got []int
+		for v := range out {
+			got = append(got, v)
+		}
+		slices.Sort(got)
+		require.Equal([]int{2, 6}, got)
+		require.Len(sunk, 1)
+		requirePanicError(t, <-sunk, "sink boom")
+	})
+
 	t.Run("nilTailPanic", func(t *testing.T) {
 		var tail pipe.Tail[int]
 		require.PanicsWithValue(t, "pipe: Tail.MapErrorSinkAsync: nil pipe.Tail[int]", func() {
@@ -1365,6 +1792,15 @@ func TestTailReduce(t *testing.T) {
 		head.Close()
 		got := tail.Reduce(nil, func(i int, acc []int) []int { return append(acc, i) })
 		require.Equal(t, []int{1, 2, 3}, got)
+	})
+
+	t.Run("panicPropagates", func(t *testing.T) {
+		head, tail := pipe.New[int](3)
+		head.Push(1)
+		head.Push(2)
+		head.Push(3)
+		head.Close()
+		require.PanicsWithValue(t, "boom", func() { tail.Reduce(0, func(int, int) int { panic("boom") }) })
 	})
 
 	t.Run("nilTailPanic", func(t *testing.T) {
@@ -2099,6 +2535,15 @@ func TestTailSink(t *testing.T) {
 		require.Equal(t, []int{1, 2, 3}, got)
 	})
 
+	t.Run("panicPropagates", func(t *testing.T) {
+		head, tail := pipe.New[int](3)
+		head.Push(1)
+		head.Push(2)
+		head.Push(3)
+		head.Close()
+		require.PanicsWithValue(t, "boom", func() { tail.Sink(func(int) { panic("boom") }) })
+	})
+
 	t.Run("nilTailPanic", func(t *testing.T) {
 		var tail pipe.Tail[int]
 		require.PanicsWithValue(t, "pipe: Tail.Sink: nil pipe.Tail[int]", func() { tail.Sink(func(int) {}) })
@@ -2205,6 +2650,30 @@ func TestTailSinkError(t *testing.T) {
 		require.Equal([]error{errBoom, errBoom}, got)
 	})
 
+	t.Run("panicRecovered", func(t *testing.T) {
+		require := require.New(t)
+		head, tail := pipe.New[int](3)
+		head.Push(1)
+		head.Push(2)
+		head.Push(3)
+		head.Close()
+		var seen []int
+		errs := tail.SinkError(func(i int) error {
+			if i == 2 {
+				panic("boom")
+			}
+			seen = append(seen, i)
+			return nil
+		})
+		var gotErrs []error
+		for err := range errs {
+			gotErrs = append(gotErrs, err)
+		}
+		require.Equal([]int{1, 3}, seen)
+		require.Len(gotErrs, 1)
+		requirePanicError(t, gotErrs[0], "boom")
+	})
+
 	t.Run("nilTailPanic", func(t *testing.T) {
 		var tail pipe.Tail[int]
 		require.PanicsWithValue(t, "pipe: Tail.SinkError: nil pipe.Tail[int]", func() { tail.SinkError(errOnEven) })
@@ -2264,6 +2733,35 @@ func TestTailSinkErrorAsync(t *testing.T) {
 		require.Equal([]int{1, 2, 3}, got)
 	})
 
+	t.Run("panicRecovered", func(t *testing.T) {
+		require := require.New(t)
+		head, tail := pipe.New[int](3)
+		head.Push(1)
+		head.Push(2)
+		head.Push(3)
+		head.Close()
+		seen := make(chan int, 3)
+		errs := tail.SinkErrorAsync(4, func(i int) error {
+			if i == 2 {
+				panic("boom")
+			}
+			seen <- i
+			return nil
+		})
+		var gotErrs []error
+		for err := range errs {
+			gotErrs = append(gotErrs, err)
+		}
+		var got []int
+		for len(seen) > 0 {
+			got = append(got, <-seen)
+		}
+		slices.Sort(got)
+		require.Equal([]int{1, 3}, got)
+		require.Len(gotErrs, 1)
+		requirePanicError(t, gotErrs[0], "boom")
+	})
+
 	t.Run("nilTailPanic", func(t *testing.T) {
 		var tail pipe.Tail[int]
 		require.PanicsWithValue(t, "pipe: Tail.SinkErrorAsync: nil pipe.Tail[int]", func() { tail.SinkErrorAsync(4, errOnEven) })
@@ -2302,6 +2800,56 @@ func TestTailSinkErrorSink(t *testing.T) {
 		}, func(err error) { sunk = append(sunk, err) })
 		require.Equal([]int{1, 2, 3, 4}, seen)
 		require.Equal([]error{errBoom, errBoom}, sunk)
+	})
+
+	t.Run("panicRecovered", func(t *testing.T) {
+		require := require.New(t)
+		head, tail := pipe.New[int](3)
+		head.Push(1)
+		head.Push(2)
+		head.Push(3)
+		head.Close()
+		var seen []int
+		var sunk []error
+		tail.SinkErrorSink(func(i int) error {
+			if i == 2 {
+				panic("boom")
+			}
+			seen = append(seen, i)
+			return nil
+		}, func(err error) { sunk = append(sunk, err) })
+		require.Equal([]int{1, 3}, seen)
+		require.Len(sunk, 1)
+		requirePanicError(t, sunk[0], "boom")
+	})
+
+	t.Run("errSinkPanicRecovered", func(t *testing.T) {
+		require := require.New(t)
+		head, tail := pipe.New[int](3)
+		head.Push(1)
+		head.Push(2)
+		head.Push(3)
+		head.Close()
+		var seen []int
+		var sunk []error
+		tail.SinkErrorSink(func(i int) error {
+			seen = append(seen, i)
+			return errOnEven(i)
+		}, panicOnBoom(&sunk))
+		require.Equal([]int{1, 2, 3}, seen)
+		require.Len(sunk, 1)
+		requirePanicError(t, sunk[0], "sink boom")
+	})
+
+	t.Run("errSinkSecondPanicPropagates", func(t *testing.T) {
+		head, tail := pipe.New[int](3)
+		head.Push(1)
+		head.Push(2)
+		head.Push(3)
+		head.Close()
+		require.PanicsWithValue(t, "boom", func() {
+			tail.SinkErrorSink(errOnEven, func(error) { panic("boom") })
+		})
 	})
 
 	t.Run("nilTailPanic", func(t *testing.T) {
@@ -2385,6 +2933,61 @@ func TestTailSinkErrorSinkAsync(t *testing.T) {
 			}
 			require.Equal([]int{1, 2, 3}, got)
 			require.Empty(sunk)
+		})
+	})
+
+	t.Run("panicRecovered", func(t *testing.T) {
+		synctest.Test(t, func(t *testing.T) {
+			require := require.New(t)
+			head, tail := pipe.New[int](3)
+			head.Push(1)
+			head.Push(2)
+			head.Push(3)
+			head.Close()
+			seen := make(chan int, 3)
+			sunk := make(chan error, 3)
+			tail.SinkErrorSinkAsync(4, func(i int) error {
+				if i == 2 {
+					panic("boom")
+				}
+				seen <- i
+				return nil
+			}, func(err error) { sunk <- err })
+			synctest.Wait()
+			var got []int
+			for len(seen) > 0 {
+				got = append(got, <-seen)
+			}
+			slices.Sort(got)
+			require.Equal([]int{1, 3}, got)
+			require.Len(sunk, 1)
+			requirePanicError(t, <-sunk, "boom")
+		})
+	})
+
+	t.Run("errSinkPanicRecovered", func(t *testing.T) {
+		synctest.Test(t, func(t *testing.T) {
+			require := require.New(t)
+			head, tail := pipe.New[int](3)
+			head.Push(1)
+			head.Push(2)
+			head.Push(3)
+			head.Close()
+			seen := make(chan int, 3)
+			sunk := make(chan error, 3)
+			tail.SinkErrorSinkAsync(4, func(i int) error {
+				seen <- i
+				return errOnEven(i)
+			}, panicOnBoomChan(sunk))
+			synctest.Wait()
+			var got []int
+			for len(seen) > 0 {
+				got = append(got, <-seen)
+			}
+			slices.Sort(got)
+			require.Equal([]int{1, 2, 3}, got)
+			require.Len(sunk, 1)
+			requirePanicError(t, <-sunk, "sink boom")
 		})
 	})
 
@@ -2564,6 +3167,27 @@ func TestTailTapError(t *testing.T) {
 		require.Equal([]error{errBoom}, gotErrs)
 	})
 
+	t.Run("panicRecovered", func(t *testing.T) {
+		require := require.New(t)
+		head, tail := pipe.New[int](3)
+		head.Push(1)
+		head.Push(2)
+		head.Push(3)
+		head.Close()
+		out, errs := tail.TapError(nilPanicOnTwo)
+		var got []int
+		for v := range out {
+			got = append(got, v)
+		}
+		var gotErrs []error
+		for err := range errs {
+			gotErrs = append(gotErrs, err)
+		}
+		require.Equal([]int{1, 2, 3}, got)
+		require.Len(gotErrs, 1)
+		requirePanicError(t, gotErrs[0], "boom")
+	})
+
 	t.Run("nilTailPanic", func(t *testing.T) {
 		var tail pipe.Tail[int]
 		require.PanicsWithValue(t, "pipe: Tail.TapError: nil pipe.Tail[int]", func() { tail.TapError(errOnEven) })
@@ -2629,6 +3253,28 @@ func TestTailTapErrorAsync(t *testing.T) {
 		require.False(ok, "got an error, want closed")
 	})
 
+	t.Run("panicRecovered", func(t *testing.T) {
+		require := require.New(t)
+		head, tail := pipe.New[int](3)
+		head.Push(1)
+		head.Push(2)
+		head.Push(3)
+		head.Close()
+		out, errs := tail.TapErrorAsync(4, nilPanicOnTwo)
+		var got []int
+		for v := range out {
+			got = append(got, v)
+		}
+		var gotErrs []error
+		for err := range errs {
+			gotErrs = append(gotErrs, err)
+		}
+		slices.Sort(got)
+		require.Equal([]int{1, 2, 3}, got)
+		require.Len(gotErrs, 1)
+		requirePanicError(t, gotErrs[0], "boom")
+	})
+
 	t.Run("nilTailPanic", func(t *testing.T) {
 		var tail pipe.Tail[int]
 		require.PanicsWithValue(t, "pipe: Tail.TapErrorAsync: nil pipe.Tail[int]", func() { tail.TapErrorAsync(4, errOnEven) })
@@ -2668,6 +3314,42 @@ func TestTailTapErrorSink(t *testing.T) {
 		}
 		require.Equal([]int{1, 2, 3}, got)
 		require.Equal([]error{errBoom}, sunk)
+	})
+
+	t.Run("panicRecovered", func(t *testing.T) {
+		require := require.New(t)
+		head, tail := pipe.New[int](3)
+		head.Push(1)
+		head.Push(2)
+		head.Push(3)
+		head.Close()
+		var sunk []error
+		out := tail.TapErrorSink(nilPanicOnTwo, func(err error) { sunk = append(sunk, err) })
+		var got []int
+		for v := range out {
+			got = append(got, v)
+		}
+		require.Equal([]int{1, 2, 3}, got)
+		require.Len(sunk, 1)
+		requirePanicError(t, sunk[0], "boom")
+	})
+
+	t.Run("sinkPanicRecovered", func(t *testing.T) {
+		require := require.New(t)
+		head, tail := pipe.New[int](3)
+		head.Push(1)
+		head.Push(2)
+		head.Push(3)
+		head.Close()
+		var sunk []error
+		out := tail.TapErrorSink(errOnEven, panicOnBoom(&sunk))
+		var got []int
+		for v := range out {
+			got = append(got, v)
+		}
+		require.Equal([]int{1, 2, 3}, got)
+		require.Len(sunk, 1)
+		requirePanicError(t, sunk[0], "sink boom")
 	})
 
 	t.Run("nilTailPanic", func(t *testing.T) {
@@ -2737,6 +3419,44 @@ func TestTailTapErrorSinkAsync(t *testing.T) {
 		}
 		require.Equal([]int{1, 2, 3}, got)
 		require.Empty(sunk)
+	})
+
+	t.Run("panicRecovered", func(t *testing.T) {
+		require := require.New(t)
+		head, tail := pipe.New[int](3)
+		head.Push(1)
+		head.Push(2)
+		head.Push(3)
+		head.Close()
+		sunk := make(chan error, 3)
+		out := tail.TapErrorSinkAsync(4, nilPanicOnTwo, func(err error) { sunk <- err })
+		var got []int
+		for v := range out {
+			got = append(got, v)
+		}
+		slices.Sort(got)
+		require.Equal([]int{1, 2, 3}, got)
+		require.Len(sunk, 1)
+		requirePanicError(t, <-sunk, "boom")
+	})
+
+	t.Run("sinkPanicRecovered", func(t *testing.T) {
+		require := require.New(t)
+		head, tail := pipe.New[int](3)
+		head.Push(1)
+		head.Push(2)
+		head.Push(3)
+		head.Close()
+		sunk := make(chan error, 3)
+		out := tail.TapErrorSinkAsync(4, errOnEven, panicOnBoomChan(sunk))
+		var got []int
+		for v := range out {
+			got = append(got, v)
+		}
+		slices.Sort(got)
+		require.Equal([]int{1, 2, 3}, got)
+		require.Len(sunk, 1)
+		requirePanicError(t, <-sunk, "sink boom")
 	})
 
 	t.Run("nilTailPanic", func(t *testing.T) {
