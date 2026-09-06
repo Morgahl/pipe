@@ -26,7 +26,7 @@ sum := tail.
     Reduce(0, func(i, acc int) int { return acc + i })
 ```
 
-Each `Tail[T]` method returns a new `Tail[T]` (or a value for the blocking operations `Reduce`, `Sink`, `Drain`, `Wait`) and closes what it returns after its input is closed and emptied. Chains read top to bottom in the order values flow.
+Each `Tail[T]` method returns a new `Tail[T]` (or a value for the blocking operations `Reduce`, `Sink`, `Drain`, `Wait`) and closes what it returns after its input is closed and emptied. Chains read top to bottom in the order values flow. An operation handed an input it cannot use, such as a nil `Tail[T]` or a nil function, panics at the call rather than in a worker goroutine; the package documentation lists every case.
 
 # Examples
 

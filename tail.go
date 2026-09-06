@@ -5,14 +5,15 @@ import "time"
 // Tail is the pull only end of a channel. This is essentially a <-chan T and can be used the same
 // way as one would use a receive only channel in Go under normal syntax usages. However this variant
 // has methods for pulling from the channel and for functional operations common to the use and
-// lifecycle of channels. A T can only be pulled from a Tail.
+// lifecycle of channels. A T can only be pulled from a Tail. Every method other than [Tail.TryPull]
+// panics when called on a nil Tail.
 type Tail[T any] <-chan T
 
 // New returns the [Head] and [Tail] of a new channel with the given type T. This is essentially a
 // chan T split into its push only and pull only ends, each with methods for operations common to
 // the use and lifecycle of channels.
 //
-// Passing a len of 0 will create an unbuffered channel.
+// Passing a len of 0 will create an unbuffered channel. A negative len panics.
 func New[T any](len int) (Head[T], Tail[T]) {
 	pipe := make(chan T, len)
 	return Head[T](pipe), Tail[T](pipe)
@@ -21,8 +22,12 @@ func New[T any](len int) (Head[T], Tail[T]) {
 // FanIn is a non-blocking operation that creates len(tails) goroutines and forwards each T pulled
 // onto the returned tail only channel of specified size. Each goroutine will exit after its assigned
 // tail only channel is closed and emptied. The last goroutine will close the returned tail only
-// channel to signal completion of processing. Passing no tails returns a closed channel.
+// channel to signal completion of processing. Passing no tails returns a closed channel. Passing a nil
+// tail panics.
 func FanIn[T any](size int, tails ...Tail[T]) Tail[T] {
+	for _, tail := range tails {
+		assert(tail != nil, "pipe: FanIn: nil %T", tail)
+	}
 	head, tail := New[T](size)
 	if len(tails) < 1 {
 		// Let's never return a nil channel, a close empty channel has better behaviors
@@ -37,8 +42,13 @@ func FanIn[T any](size int, tails ...Tail[T]) Tail[T] {
 // pushing each T onto the returned tail only channel of specified size. Once repeat is exhausted the
 // goroutine calls closer, closes the returned tail only channel and exits. Passing 0 or any other
 // negative value calls source zero times, calls closer and closes the channel immeadiately. Passing
-// [RepeatForever] will call source until the program exits.
+// [RepeatForever] will call source until the program exits. Passing a nil source panics. A nil closer
+// is treated as a no-op.
 func Source[T any, S func() T, C func()](repeat, size int, source S, closer C) Tail[T] {
+	assert(source != nil, "pipe: Source: nil source")
+	if closer == nil {
+		closer = C(func() {})
+	}
 	head, tail := New[T](size)
 	go sourceWorker(head, repeat, source, closer)
 	return tail
@@ -48,8 +58,12 @@ func Source[T any, S func() T, C func()](repeat, size int, source S, closer C) T
 // Each error is pushed onto the returned error tail only channel and no T is pushed for that call.
 // Returning [Done] from source ends the goroutine as if repeat were exhausted and [Done] is not
 // pushed. closer is called and both returned channels are closed once repeat is exhausted or [Done]
-// is returned.
+// is returned. Passing a nil source panics. A nil closer is treated as a no-op.
 func SourceError[T any, S func() (T, error), C func()](repeat, size int, source S, closer C) (Tail[T], Tail[error]) {
+	assert(source != nil, "pipe: SourceError: nil source")
+	if closer == nil {
+		closer = C(func() {})
+	}
 	head, tail := New[T](size)
 	err := make(chan error, size)
 	go sourceErrorWorker(head, err, repeat, source, closer)
@@ -57,23 +71,32 @@ func SourceError[T any, S func() (T, error), C func()](repeat, size int, source 
 }
 
 // SourceErrorSink is a non-blocking operation that behaves as [SourceError] but each error is
-// passed to sink instead of being pushed onto a channel. [Done] is not passed to sink.
+// passed to sink instead of being pushed onto a channel. [Done] is not passed to sink. Passing a nil
+// source or sink panics. A nil closer is treated as a no-op.
 func SourceErrorSink[T any, S func() (T, error), C func(), E func(error)](repeat, size int, source S, closer C, sink E) Tail[T] {
+	assert(source != nil, "pipe: SourceErrorSink: nil source")
+	assert(sink != nil, "pipe: SourceErrorSink: nil sink")
+	if closer == nil {
+		closer = C(func() {})
+	}
 	head, tail := New[T](size)
 	go sourceErrorSinkWorker(head, repeat, source, closer, sink)
 	return tail
 }
 
 // Pull is a blocking operation that pulls a T from the channel if available. This blocks while no T
-// is available. If the channel is closed and empty, or nil, this will return a zero version of the
-// T type.
+// is available. If the channel is closed and empty this will return a zero version of the T type.
+// Pulling from a nil Tail panics.
 func (tl Tail[T]) Pull() T {
+	assert(tl != nil, "pipe: Tail.Pull: nil %T", tl)
 	return <-tl
 }
 
 // PullSafe is a blocking operation that pulls a T from the channel if available. This returns true
-// if the T returned is valid, false if the channel is closed and empty, or nil.
+// if the T returned is valid, false if the channel is closed and empty. Pulling from a nil Tail
+// panics.
 func (tl Tail[T]) PullSafe() (t T, ok bool) {
+	assert(tl != nil, "pipe: Tail.PullSafe: nil %T", tl)
 	t, ok = <-tl
 	return
 }
@@ -89,23 +112,26 @@ func (tl Tail[T]) TryPull() (t T, ok bool) {
 }
 
 // Drain is a blocking operation that iterates over the channel discarding values until the channel
-// is closed and no further elements remain. This returns immeadiately if the channel is closed or
-// nil.
+// is closed and no further elements remain. This returns immeadiately if the channel is closed.
+// Draining a nil Tail panics.
 func (tl Tail[T]) Drain() {
+	assert(tl != nil, "pipe: Tail.Drain: nil %T", tl)
 	for range tl {
 	}
 }
 
 // Wait is a blocking operation that waits for a value to be returned from the channel. If the
-// channel is closed or nil this will immeadiately return.
+// channel is closed this will immeadiately return. Waiting on a nil Tail panics.
 func (tl Tail[T]) Wait() {
+	assert(tl != nil, "pipe: Tail.Wait: nil %T", tl)
 	<-tl
 }
 
 // FanOut is a non-blocking operation that creates count tail only channels of the same size as this
 // channel and forwards every T pulled onto each of them. All returned channels are closed after this
-// channel is closed and emptied.
+// channel is closed and emptied. A nil Tail panics. A negative count panics.
 func (tl Tail[T]) FanOut(count int) []Tail[T] {
+	assert(tl != nil, "pipe: Tail.FanOut: nil %T", tl)
 	tails := make([]Tail[T], count)
 	fan := make([]Head[T], count)
 	for i := range tails {
@@ -117,8 +143,10 @@ func (tl Tail[T]) FanOut(count int) []Tail[T] {
 
 // Filter is a non-blocking operation that forwards each T for which filter returns true onto the
 // returned tail only channel of the same size as this channel. The returned channel is closed after
-// this channel is closed and emptied.
+// this channel is closed and emptied. A nil Tail or a nil filter panics.
 func (tl Tail[T]) Filter[F func(T) bool](filter F) Tail[T] {
+	assert(tl != nil, "pipe: Tail.Filter: nil %T", tl)
+	assert(filter != nil, "pipe: Tail.Filter: nil filter")
 	head, tail := New[T](cap(tl))
 	go filterWorker(tl, head, filter)
 	return tail
@@ -131,7 +159,11 @@ func (tl Tail[T]) Filter[F func(T) bool](filter F) Tail[T] {
 // Ordering is lost through FilterAsync. Each goroutine pulls from this channel and pushes onto the
 // returned channel independently, so values are emitted in the order filter finishes, not the order
 // they were pulled.
+//
+// A nil Tail or a nil filter panics.
 func (tl Tail[T]) FilterAsync[F func(T) bool](workers int, filter F) Tail[T] {
+	assert(tl != nil, "pipe: Tail.FilterAsync: nil %T", tl)
+	assert(filter != nil, "pipe: Tail.FilterAsync: nil filter")
 	head, tail := New[T](cap(tl))
 	go filterAsyncCoordinator(tl, head, workers, filter)
 	return tail
@@ -139,8 +171,11 @@ func (tl Tail[T]) FilterAsync[F func(T) bool](workers int, filter F) Tail[T] {
 
 // FilterError is a non-blocking operation that behaves as [Tail.Filter] but filter may return an
 // error. Each error is pushed onto the returned error tail only channel and the T is discarded.
-// Both returned channels are closed after this channel is closed and emptied.
+// Both returned channels are closed after this channel is closed and emptied. A nil Tail or a nil
+// filter panics.
 func (tl Tail[T]) FilterError[F func(T) (bool, error)](filter F) (Tail[T], Tail[error]) {
+	assert(tl != nil, "pipe: Tail.FilterError: nil %T", tl)
+	assert(filter != nil, "pipe: Tail.FilterError: nil filter")
 	head, tail := New[T](cap(tl))
 	headErr, tailErr := New[error](cap(tl))
 	go filterErrorWorker(tl, head, headErr, filter)
@@ -154,7 +189,11 @@ func (tl Tail[T]) FilterError[F func(T) (bool, error)](filter F) (Tail[T], Tail[
 // Ordering is lost through FilterErrorAsync. Each goroutine pulls from this channel and pushes onto
 // the returned channels independently, so values and errors are emitted in the order filter
 // finishes, not the order they were pulled.
+//
+// A nil Tail or a nil filter panics.
 func (tl Tail[T]) FilterErrorAsync[F func(T) (bool, error)](workers int, filter F) (Tail[T], Tail[error]) {
+	assert(tl != nil, "pipe: Tail.FilterErrorAsync: nil %T", tl)
+	assert(filter != nil, "pipe: Tail.FilterErrorAsync: nil filter")
 	head, tail := New[T](cap(tl))
 	headErr, tailErr := New[error](cap(tl))
 	go filterErrorAsyncCoordinator(tl, head, headErr, workers, filter)
@@ -162,8 +201,11 @@ func (tl Tail[T]) FilterErrorAsync[F func(T) (bool, error)](workers int, filter 
 }
 
 // FilterErrorSink is a non-blocking operation that behaves as [Tail.FilterError] but each error is
-// passed to sink instead of being pushed onto a channel.
+// passed to sink instead of being pushed onto a channel. A nil Tail, filter or sink panics.
 func (tl Tail[T]) FilterErrorSink[F func(T) (bool, error), S func(error)](filter F, sink S) Tail[T] {
+	assert(tl != nil, "pipe: Tail.FilterErrorSink: nil %T", tl)
+	assert(filter != nil, "pipe: Tail.FilterErrorSink: nil filter")
+	assert(sink != nil, "pipe: Tail.FilterErrorSink: nil sink")
 	head, tail := New[T](cap(tl))
 	go filterErrorSinkWorker(tl, head, filter, sink)
 	return tail
@@ -176,7 +218,12 @@ func (tl Tail[T]) FilterErrorSink[F func(T) (bool, error), S func(error)](filter
 // Ordering is lost through FilterErrorSinkAsync. Each goroutine pulls from this channel, pushes onto
 // the returned channel and calls sink independently, so values are emitted and errors sunk in the
 // order filter finishes, not the order they were pulled.
+//
+// A nil Tail, filter or sink panics.
 func (tl Tail[T]) FilterErrorSinkAsync[F func(T) (bool, error), S func(error)](workers int, filter F, sink S) Tail[T] {
+	assert(tl != nil, "pipe: Tail.FilterErrorSinkAsync: nil %T", tl)
+	assert(filter != nil, "pipe: Tail.FilterErrorSinkAsync: nil filter")
+	assert(sink != nil, "pipe: Tail.FilterErrorSinkAsync: nil sink")
 	head, tail := New[T](cap(tl))
 	go filterErrorSinkAsyncCoordinator(tl, head, workers, filter, sink)
 	return tail
@@ -184,8 +231,10 @@ func (tl Tail[T]) FilterErrorSinkAsync[F func(T) (bool, error), S func(error)](w
 
 // Map is a non-blocking operation that pushes the result of mp for each T onto the returned tail
 // only channel of the same size as this channel. The returned channel is closed after this channel
-// is closed and emptied.
+// is closed and emptied. A nil Tail or a nil mp panics.
 func (tl Tail[T]) Map[U any, M func(T) U](mp M) Tail[U] {
+	assert(tl != nil, "pipe: Tail.Map: nil %T", tl)
+	assert(mp != nil, "pipe: Tail.Map: nil mp")
 	head, tail := New[U](cap(tl))
 	go mapWorker(tl, head, mp)
 	return tail
@@ -198,7 +247,11 @@ func (tl Tail[T]) Map[U any, M func(T) U](mp M) Tail[U] {
 // Ordering is lost through MapAsync. Each goroutine pulls from this channel and pushes onto the
 // returned channel independently, so values are emitted in the order mp finishes, not the order
 // they were pulled.
+//
+// A nil Tail or a nil mp panics.
 func (tl Tail[T]) MapAsync[U any, M func(T) U](workers int, mp M) Tail[U] {
+	assert(tl != nil, "pipe: Tail.MapAsync: nil %T", tl)
+	assert(mp != nil, "pipe: Tail.MapAsync: nil mp")
 	head, tail := New[U](cap(tl))
 	go mapAsyncCoordinator(tl, head, workers, mp)
 	return tail
@@ -206,8 +259,11 @@ func (tl Tail[T]) MapAsync[U any, M func(T) U](workers int, mp M) Tail[U] {
 
 // MapError is a non-blocking operation that behaves as [Tail.Map] but mp may return an error. Each
 // error is pushed onto the returned error tail only channel and no U is pushed for that T. Both
-// returned channels are closed after this channel is closed and emptied.
+// returned channels are closed after this channel is closed and emptied. A nil Tail or a nil mp
+// panics.
 func (tl Tail[T]) MapError[U any, M func(T) (U, error)](mp M) (Tail[U], Tail[error]) {
+	assert(tl != nil, "pipe: Tail.MapError: nil %T", tl)
+	assert(mp != nil, "pipe: Tail.MapError: nil mp")
 	head, tail := New[U](cap(tl))
 	err := make(chan error, cap(tl))
 	go mapErrorWorker(tl, head, err, mp)
@@ -221,7 +277,11 @@ func (tl Tail[T]) MapError[U any, M func(T) (U, error)](mp M) (Tail[U], Tail[err
 // Ordering is lost through MapErrorAsync. Each goroutine pulls from this channel and pushes onto the
 // returned channels independently, so values and errors are emitted in the order mp finishes, not
 // the order they were pulled.
+//
+// A nil Tail or a nil mp panics.
 func (tl Tail[T]) MapErrorAsync[U any, M func(T) (U, error)](workers int, mp M) (Tail[U], Tail[error]) {
+	assert(tl != nil, "pipe: Tail.MapErrorAsync: nil %T", tl)
+	assert(mp != nil, "pipe: Tail.MapErrorAsync: nil mp")
 	head, tail := New[U](cap(tl))
 	err := make(chan error, cap(tl))
 	go mapErrorAsyncCoordinator(tl, head, err, workers, mp)
@@ -229,8 +289,11 @@ func (tl Tail[T]) MapErrorAsync[U any, M func(T) (U, error)](workers int, mp M) 
 }
 
 // MapErrorSink is a non-blocking operation that behaves as [Tail.MapError] but each error is passed
-// to sink instead of being pushed onto a channel.
+// to sink instead of being pushed onto a channel. A nil Tail, mp or sink panics.
 func (tl Tail[T]) MapErrorSink[U any, M func(T) (U, error), S func(error)](mp M, sink S) Tail[U] {
+	assert(tl != nil, "pipe: Tail.MapErrorSink: nil %T", tl)
+	assert(mp != nil, "pipe: Tail.MapErrorSink: nil mp")
+	assert(sink != nil, "pipe: Tail.MapErrorSink: nil sink")
 	head, tail := New[U](cap(tl))
 	go mapErrorSinkWorker(tl, head, mp, sink)
 	return tail
@@ -243,7 +306,12 @@ func (tl Tail[T]) MapErrorSink[U any, M func(T) (U, error), S func(error)](mp M,
 // Ordering is lost through MapErrorSinkAsync. Each goroutine pulls from this channel, pushes onto
 // the returned channel and calls sink independently, so values are emitted and errors sunk in the
 // order mp finishes, not the order they were pulled.
+//
+// A nil Tail, mp or sink panics.
 func (tl Tail[T]) MapErrorSinkAsync[U any, M func(T) (U, error), S func(error)](workers int, mp M, sink S) Tail[U] {
+	assert(tl != nil, "pipe: Tail.MapErrorSinkAsync: nil %T", tl)
+	assert(mp != nil, "pipe: Tail.MapErrorSinkAsync: nil mp")
+	assert(sink != nil, "pipe: Tail.MapErrorSinkAsync: nil sink")
 	head, tail := New[U](cap(tl))
 	go mapErrorSinkAsyncCoordinator(tl, head, workers, mp, sink)
 	return tail
@@ -251,7 +319,10 @@ func (tl Tail[T]) MapErrorSinkAsync[U any, M func(T) (U, error), S func(error)](
 
 // Reduce is a blocking operation that calls reduce with each T pulled and the current accumulator,
 // starting from acc, and returns the final accumulator once this channel is closed and emptied.
+// A nil Tail or a nil reduce panics.
 func (tl Tail[T]) Reduce[Acc any, R func(T, Acc) Acc](acc Acc, reduce R) Acc {
+	assert(tl != nil, "pipe: Tail.Reduce: nil %T", tl)
+	assert(reduce != nil, "pipe: Tail.Reduce: nil reduce")
 	for t := range tl {
 		acc = reduce(t, acc)
 	}
@@ -260,8 +331,10 @@ func (tl Tail[T]) Reduce[Acc any, R func(T, Acc) Acc](acc Acc, reduce R) Acc {
 
 // ReduceAndEmit is a non-blocking operation that behaves as [Tail.Reduce] but pushes the final
 // accumulator onto the returned tail only channel of size 1 instead of returning it. The returned
-// channel is closed after the accumulator is pushed.
+// channel is closed after the accumulator is pushed. A nil Tail or a nil reduce panics.
 func (tl Tail[T]) ReduceAndEmit[Acc any, R func(T, Acc) Acc](acc Acc, reduce R) Tail[Acc] {
+	assert(tl != nil, "pipe: Tail.ReduceAndEmit: nil %T", tl)
+	assert(reduce != nil, "pipe: Tail.ReduceAndEmit: nil reduce")
 	// we only expect to emit a single value and then close the out chan immeadiately
 	// after processing. This allows the goroutine to exit without forcing it to sync
 	// with the recieving goroutine.
@@ -273,8 +346,13 @@ func (tl Tail[T]) ReduceAndEmit[Acc any, R func(T, Acc) Acc](acc Acc, reduce R) 
 // Window is a non-blocking operation that calls reduce with each T pulled and the current
 // accumulator. Every window duration the accumulator is pushed onto the returned tail only channel
 // of size 1 and replaced with a fresh one from acc. The final accumulator is pushed and the returned
-// channel closed after this channel is closed and emptied.
+// channel closed after this channel is closed and emptied. A nil Tail, acc or reduce panics. A window
+// of zero or less panics.
 func (tl Tail[T]) Window[Acc any, A func() Acc, R func(T, Acc) Acc](window time.Duration, acc A, reduce R) Tail[Acc] {
+	assert(tl != nil, "pipe: Tail.Window: nil %T", tl)
+	assert(window > 0, "pipe: Tail.Window: non-positive window %s", window)
+	assert(acc != nil, "pipe: Tail.Window: nil acc")
+	assert(reduce != nil, "pipe: Tail.Window: nil reduce")
 	head, tail := New[Acc](1)
 	go windowWorker(tl, head, window, reduce, acc)
 	return tail
@@ -284,8 +362,11 @@ func (tl Tail[T]) Window[Acc any, A func() Acc, R func(T, Acc) Acc](window time.
 // as this channel, and forwards each T onto the route whose match equals compare(T). A T matching no
 // route is forwarded onto orElse. Routes are returned in the order of matches. Duplicate matches each
 // return a channel but only the last one created for that match receives values and is closed. All
-// other returned channels are closed after this channel is closed and emptied.
+// other returned channels are closed after this channel is closed and emptied. A nil Tail or a nil
+// compare panics.
 func (tl Tail[T]) Router[Cmp comparable, C func(T) Cmp](matches []Cmp, compare C) (routes []Tail[T], orElse Tail[T]) {
+	assert(tl != nil, "pipe: Tail.Router: nil %T", tl)
+	assert(compare != nil, "pipe: Tail.Router: nil compare")
 	elsehead, elsetail := New[T](cap(tl))
 	routes = make([]Tail[T], len(matches))
 	mappedRoutes := make(map[Cmp]Head[T], len(matches))
@@ -303,7 +384,11 @@ func (tl Tail[T]) Router[Cmp comparable, C func(T) Cmp](matches []Cmp, compare C
 // Ordering is lost through RouterAsync. Each goroutine pulls from this channel and pushes onto the
 // routes and orElse independently, so values are emitted in the order compare finishes, not the
 // order they were pulled.
+//
+// A nil Tail or a nil compare panics.
 func (tl Tail[T]) RouterAsync[Cmp comparable, C func(T) Cmp](workers int, matches []Cmp, compare C) (routes []Tail[T], orElse Tail[T]) {
+	assert(tl != nil, "pipe: Tail.RouterAsync: nil %T", tl)
+	assert(compare != nil, "pipe: Tail.RouterAsync: nil compare")
 	elsehead, elsetail := New[T](cap(tl))
 	routes = make([]Tail[T], len(matches))
 	mappedRoutes := make(map[Cmp]Head[T], len(matches))
@@ -315,8 +400,12 @@ func (tl Tail[T]) RouterAsync[Cmp comparable, C func(T) Cmp](workers int, matche
 }
 
 // RouterWithSink is a non-blocking operation that behaves as [Tail.Router] but a T matching no
-// route is passed to sink instead of being forwarded onto a channel.
+// route is passed to sink instead of being forwarded onto a channel. A nil Tail, compare or sink
+// panics.
 func (tl Tail[T]) RouterWithSink[Cmp comparable, C func(T) Cmp, S func(T)](matches []Cmp, compare C, sink S) (routes []Tail[T]) {
+	assert(tl != nil, "pipe: Tail.RouterWithSink: nil %T", tl)
+	assert(compare != nil, "pipe: Tail.RouterWithSink: nil compare")
+	assert(sink != nil, "pipe: Tail.RouterWithSink: nil sink")
 	routes = make([]Tail[T], len(matches))
 	mappedRoutes := make(map[Cmp]Head[T], len(matches))
 	for i, match := range matches {
@@ -333,7 +422,12 @@ func (tl Tail[T]) RouterWithSink[Cmp comparable, C func(T) Cmp, S func(T)](match
 // Ordering is lost through RouterWithSinkAsync. Each goroutine pulls from this channel, pushes onto
 // the routes and calls sink independently, so values are emitted or sunk in the order compare
 // finishes, not the order they were pulled.
+//
+// A nil Tail, compare or sink panics.
 func (tl Tail[T]) RouterWithSinkAsync[Cmp comparable, C func(T) Cmp, S func(T)](workers int, matches []Cmp, compare C, sink S) (routes []Tail[T]) {
+	assert(tl != nil, "pipe: Tail.RouterWithSinkAsync: nil %T", tl)
+	assert(compare != nil, "pipe: Tail.RouterWithSinkAsync: nil compare")
+	assert(sink != nil, "pipe: Tail.RouterWithSinkAsync: nil sink")
 	routes = make([]Tail[T], len(matches))
 	mappedRoutes := make(map[Cmp]Head[T], len(matches))
 	for i, match := range matches {
@@ -344,8 +438,9 @@ func (tl Tail[T]) RouterWithSinkAsync[Cmp comparable, C func(T) Cmp, S func(T)](
 }
 
 // RoundRobin is a non-blocking operation that behaves as [Tail.Distribute] with each T forwarded
-// onto the next channel in turn. A count of less than 1 returns nil.
+// onto the next channel in turn. A count of less than 1 returns nil. A nil Tail panics.
 func (tl Tail[T]) RoundRobin(count int) []Tail[T] {
+	assert(tl != nil, "pipe: Tail.RoundRobin: nil %T", tl)
 	if count < 1 {
 		return nil
 	}
@@ -356,8 +451,10 @@ func (tl Tail[T]) RoundRobin(count int) []Tail[T] {
 // Distribute is a non-blocking operation that creates count tail only channels of the same size as
 // this channel and forwards each T onto the channel at index choose(T). A count of less than 1
 // returns nil. A choose result outside 0 to count-1 panics. All returned channels are closed after
-// this channel is closed and emptied.
+// this channel is closed and emptied. A nil Tail or a nil choose panics.
 func (tl Tail[T]) Distribute[C func(T) int](count int, choose C) []Tail[T] {
+	assert(tl != nil, "pipe: Tail.Distribute: nil %T", tl)
+	assert(choose != nil, "pipe: Tail.Distribute: nil choose")
 	if count < 1 {
 		return nil
 	}
@@ -381,7 +478,11 @@ func (tl Tail[T]) Distribute[C func(T) int](count int, choose C) []Tail[T] {
 // Ordering is lost through DistributeAsync. Each goroutine pulls from this channel and pushes onto
 // the returned channels independently, so values are emitted in the order choose finishes, not the
 // order they were pulled.
+//
+// A nil Tail or a nil choose panics.
 func (tl Tail[T]) DistributeAsync[C func(T) int](workers int, count int, choose C) []Tail[T] {
+	assert(tl != nil, "pipe: Tail.DistributeAsync: nil %T", tl)
+	assert(choose != nil, "pipe: Tail.DistributeAsync: nil choose")
 	if count < 1 {
 		return nil
 	}
@@ -398,8 +499,10 @@ func (tl Tail[T]) DistributeAsync[C func(T) int](workers int, count int, choose 
 }
 
 // Sink is a blocking operation that passes each T pulled to sink until this channel is closed and
-// emptied.
+// emptied. A nil Tail or a nil sink panics.
 func (tl Tail[T]) Sink[S func(T)](sink S) {
+	assert(tl != nil, "pipe: Tail.Sink: nil %T", tl)
+	assert(sink != nil, "pipe: Tail.Sink: nil sink")
 	for t := range tl {
 		sink(t)
 	}
@@ -411,14 +514,21 @@ func (tl Tail[T]) Sink[S func(T)](sink S) {
 //
 // Ordering is lost through SinkAsync. Each goroutine pulls from this channel and calls sink
 // independently, so sink calls overlap and finish in no fixed order.
+//
+// A nil Tail or a nil sink panics.
 func (tl Tail[T]) SinkAsync[S func(T)](workers int, sink S) {
+	assert(tl != nil, "pipe: Tail.SinkAsync: nil %T", tl)
+	assert(sink != nil, "pipe: Tail.SinkAsync: nil sink")
 	go sinkAsyncCoordinator(tl, workers, sink)
 }
 
 // SinkError is a non-blocking operation that creates a goroutine passing each T pulled to sink. Each
 // error returned by sink is pushed onto the returned error tail only channel of the same size as
-// this channel. The returned channel is closed after this channel is closed and emptied.
+// this channel. The returned channel is closed after this channel is closed and emptied. A nil Tail
+// or a nil sink panics.
 func (tl Tail[T]) SinkError[S func(T) error](sink S) Tail[error] {
+	assert(tl != nil, "pipe: Tail.SinkError: nil %T", tl)
+	assert(sink != nil, "pipe: Tail.SinkError: nil sink")
 	err := make(chan error, cap(tl))
 	go sinkErrorWorker(tl, err, sink)
 	return err
@@ -431,15 +541,22 @@ func (tl Tail[T]) SinkError[S func(T) error](sink S) Tail[error] {
 // Ordering is lost through SinkErrorAsync. Each goroutine pulls from this channel and pushes onto
 // the returned channel independently, so errors are emitted in the order sink finishes, not the
 // order values were pulled.
+//
+// A nil Tail or a nil sink panics.
 func (tl Tail[T]) SinkErrorAsync[S func(T) error](workers int, sink S) Tail[error] {
+	assert(tl != nil, "pipe: Tail.SinkErrorAsync: nil %T", tl)
+	assert(sink != nil, "pipe: Tail.SinkErrorAsync: nil sink")
 	err := make(chan error, cap(tl))
 	go sinkErrorAsyncCoordinator(tl, err, workers, sink)
 	return err
 }
 
 // SinkErrorSink is a blocking operation that behaves as [Tail.Sink] but sink may return an error.
-// Each error is passed to errSink.
+// Each error is passed to errSink. A nil Tail, sink or errSink panics.
 func (tl Tail[T]) SinkErrorSink[S func(T) error, E func(error)](sink S, errSink E) {
+	assert(tl != nil, "pipe: Tail.SinkErrorSink: nil %T", tl)
+	assert(sink != nil, "pipe: Tail.SinkErrorSink: nil sink")
+	assert(errSink != nil, "pipe: Tail.SinkErrorSink: nil errSink")
 	for t := range tl {
 		if err := sink(t); err != nil {
 			errSink(err)
@@ -453,14 +570,21 @@ func (tl Tail[T]) SinkErrorSink[S func(T) error, E func(error)](sink S, errSink 
 //
 // Ordering is lost through SinkErrorSinkAsync. Each goroutine pulls from this channel and calls
 // sink and errSink independently, so calls overlap and finish in no fixed order.
+//
+// A nil Tail, sink or errSink panics.
 func (tl Tail[T]) SinkErrorSinkAsync[S func(T) error, E func(error)](workers int, sink S, errSink E) {
+	assert(tl != nil, "pipe: Tail.SinkErrorSinkAsync: nil %T", tl)
+	assert(sink != nil, "pipe: Tail.SinkErrorSinkAsync: nil sink")
+	assert(errSink != nil, "pipe: Tail.SinkErrorSinkAsync: nil errSink")
 	go sinkErrorSinkAsyncCoordinator(tl, workers, sink, errSink)
 }
 
 // Tap is a non-blocking operation that passes each T pulled to tap and then forwards it onto the
 // returned tail only channel of the same size as this channel. The returned channel is closed after
-// this channel is closed and emptied.
+// this channel is closed and emptied. A nil Tail or a nil tap panics.
 func (tl Tail[T]) Tap[Tp func(T)](tap Tp) Tail[T] {
+	assert(tl != nil, "pipe: Tail.Tap: nil %T", tl)
+	assert(tap != nil, "pipe: Tail.Tap: nil tap")
 	head, tail := New[T](cap(tl))
 	go tapWorker(tl, head, tap)
 	return tail
@@ -473,7 +597,11 @@ func (tl Tail[T]) Tap[Tp func(T)](tap Tp) Tail[T] {
 // Ordering is lost through TapAsync. Each goroutine pulls from this channel and pushes onto the
 // returned channel independently, so values are emitted in the order tap finishes, not the order
 // they were pulled.
+//
+// A nil Tail or a nil tap panics.
 func (tl Tail[T]) TapAsync[Tp func(T)](workers int, tap Tp) Tail[T] {
+	assert(tl != nil, "pipe: Tail.TapAsync: nil %T", tl)
+	assert(tap != nil, "pipe: Tail.TapAsync: nil tap")
 	head, tail := New[T](cap(tl))
 	go tapAsyncCoordinator(tl, head, workers, tap)
 	return tail
@@ -481,8 +609,11 @@ func (tl Tail[T]) TapAsync[Tp func(T)](workers int, tap Tp) Tail[T] {
 
 // TapError is a non-blocking operation that behaves as [Tail.Tap] but tap may return an error. Each
 // error is pushed onto the returned error tail only channel and the T is still forwarded. Both
-// returned channels are closed after this channel is closed and emptied.
+// returned channels are closed after this channel is closed and emptied. A nil Tail or a nil tap
+// panics.
 func (tl Tail[T]) TapError[Tp func(T) error](tap Tp) (Tail[T], Tail[error]) {
+	assert(tl != nil, "pipe: Tail.TapError: nil %T", tl)
+	assert(tap != nil, "pipe: Tail.TapError: nil tap")
 	head, tail := New[T](cap(tl))
 	err := make(chan error, cap(tl))
 	go tapErrorWorker(tl, head, err, tap)
@@ -496,7 +627,11 @@ func (tl Tail[T]) TapError[Tp func(T) error](tap Tp) (Tail[T], Tail[error]) {
 // Ordering is lost through TapErrorAsync. Each goroutine pulls from this channel and pushes onto the
 // returned channels independently, so values and errors are emitted in the order tap finishes, not
 // the order they were pulled.
+//
+// A nil Tail or a nil tap panics.
 func (tl Tail[T]) TapErrorAsync[Tp func(T) error](workers int, tap Tp) (Tail[T], Tail[error]) {
+	assert(tl != nil, "pipe: Tail.TapErrorAsync: nil %T", tl)
+	assert(tap != nil, "pipe: Tail.TapErrorAsync: nil tap")
 	head, tail := New[T](cap(tl))
 	err := make(chan error, cap(tl))
 	go tapErrorAsyncCoordinator(tl, head, err, workers, tap)
@@ -504,8 +639,11 @@ func (tl Tail[T]) TapErrorAsync[Tp func(T) error](workers int, tap Tp) (Tail[T],
 }
 
 // TapErrorSink is a non-blocking operation that behaves as [Tail.TapError] but each error is passed
-// to sink instead of being pushed onto a channel.
+// to sink instead of being pushed onto a channel. A nil Tail, tap or sink panics.
 func (tl Tail[T]) TapErrorSink[Tp func(T) error, S func(error)](tap Tp, sink S) Tail[T] {
+	assert(tl != nil, "pipe: Tail.TapErrorSink: nil %T", tl)
+	assert(tap != nil, "pipe: Tail.TapErrorSink: nil tap")
+	assert(sink != nil, "pipe: Tail.TapErrorSink: nil sink")
 	head, tail := New[T](cap(tl))
 	go tapErrorSinkWorker(tl, head, tap, sink)
 	return tail
@@ -518,7 +656,12 @@ func (tl Tail[T]) TapErrorSink[Tp func(T) error, S func(error)](tap Tp, sink S) 
 // Ordering is lost through TapErrorSinkAsync. Each goroutine pulls from this channel, pushes onto
 // the returned channel and calls sink independently, so values are emitted and errors sunk in the
 // order tap finishes, not the order they were pulled.
+//
+// A nil Tail, tap or sink panics.
 func (tl Tail[T]) TapErrorSinkAsync[Tp func(T) error, S func(error)](workers int, tap Tp, sink S) Tail[T] {
+	assert(tl != nil, "pipe: Tail.TapErrorSinkAsync: nil %T", tl)
+	assert(tap != nil, "pipe: Tail.TapErrorSinkAsync: nil tap")
+	assert(sink != nil, "pipe: Tail.TapErrorSinkAsync: nil sink")
 	head, tail := New[T](cap(tl))
 	go tapErrorSinkAsyncCoordinator(tl, head, workers, tap, sink)
 	return tail

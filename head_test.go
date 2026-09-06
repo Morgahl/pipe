@@ -34,13 +34,30 @@ func TestNew(t *testing.T) {
 		head.Push(7)
 		require.Equal(t, 7, tail.Pull())
 	})
+
+	t.Run("negativePanic", func(t *testing.T) {
+		require.PanicsWithError(t, "makechan: size out of range", func() { pipe.New[int](-1) })
+	})
 }
 
 func TestHeadClose(t *testing.T) {
-	head, tail := pipe.New[int](1)
-	head.Close()
-	_, ok := tail.PullSafe()
-	require.False(t, ok, "PullSafe on closed channel")
+	t.Run("closes", func(t *testing.T) {
+		head, tail := pipe.New[int](1)
+		head.Close()
+		_, ok := tail.PullSafe()
+		require.False(t, ok, "PullSafe on closed channel")
+	})
+
+	t.Run("closedPanic", func(t *testing.T) {
+		head, _ := pipe.New[int](1)
+		head.Close()
+		require.PanicsWithError(t, "close of closed channel", func() { head.Close() })
+	})
+
+	t.Run("nilHeadPanic", func(t *testing.T) {
+		var head pipe.Head[int]
+		require.PanicsWithError(t, "close of nil channel", func() { head.Close() })
+	})
 }
 
 func TestHeadPush(t *testing.T) {
@@ -86,6 +103,17 @@ func TestHeadPush(t *testing.T) {
 			require.Equal(2, tail.Pull())
 		})
 	})
+
+	t.Run("nilHeadPanic", func(t *testing.T) {
+		var head pipe.Head[int]
+		require.PanicsWithValue(t, "pipe: Head.Push: nil pipe.Head[int]", func() { head.Push(1) })
+	})
+
+	t.Run("closedPanic", func(t *testing.T) {
+		head, _ := pipe.New[int](1)
+		head.Close()
+		require.PanicsWithError(t, "send on closed channel", func() { head.Push(1) })
+	})
 }
 
 func TestHeadTryPush(t *testing.T) {
@@ -127,5 +155,11 @@ func TestHeadTryPush(t *testing.T) {
 	t.Run("nil", func(t *testing.T) {
 		var head pipe.Head[int]
 		require.False(t, head.TryPush(1), "TryPush on nil channel")
+	})
+
+	t.Run("closedPanic", func(t *testing.T) {
+		head, _ := pipe.New[int](1)
+		head.Close()
+		require.PanicsWithError(t, "send on closed channel", func() { head.TryPush(1) })
 	})
 }

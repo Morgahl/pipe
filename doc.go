@@ -23,4 +23,18 @@
 // is ordering. Workers push as they finish, so values leave an Async operation in the order the
 // function completes rather than the order they arrived. Nothing downstream restores that order, so
 // a chain that depends on arrival order either avoids the Async forms or reorders the values itself.
+//
+// # Bad inputs
+//
+// An operation given an input it cannot use panics at the call, in the caller's goroutine, before
+// any channel or worker is created. The panic value is a string of the form
+// "pipe: <Method>: <problem>", for example "pipe: Tail.Filter: nil filter". Bad inputs are:
+//
+//   - a nil [Tail] receiver, or a nil [Head] receiver on [Head.Push]
+//   - a nil [Tail] passed to [FanIn]
+//   - a nil function argument
+//   - a window of zero or less on [Tail.Window]
+//
+// [Tail.TryPull] and [Head.TryPush] return false on a nil receiver instead of panicking. A nil
+// closer passed to [Source], [SourceError], or [SourceErrorSink] is treated as a no-op.
 package pipe
